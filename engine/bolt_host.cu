@@ -6,7 +6,6 @@
 
 #include "bolt_common.h"
 #include "bolt_draft.h"
-#include "bolt_vision.h"
 
 #include <cuda.h>
 #include <cuda_fp16.h>
@@ -125,8 +124,7 @@ Store* open_store(const char* dir) {
     auto* s = new Store();
     s->dir = dir;
     std::string idx = slurp(std::string(dir) + "/model.safetensors.index.json");
-    // the language model, and the vision tower and its projector
-    for (const char* prefix : {"\"language_model.", "\"vision_model.", "\"mlp1."}) {
+    for (const char* prefix : {"\"language_model."}) {
         size_t p = 0;
         while (true) {
             size_t a = idx.find(prefix, p);
@@ -374,10 +372,9 @@ struct Bolt {
     int kv_row = 512;        // bytes of one token's 256 K (or V) values
     int kv_stride = 32768;   // tokens between sequences in the KV buffers (the window rounded up to a granule)
     KvPool kv;
-    Vision* vision = nullptr;
     float eps = 1e-5f, route_scale = 5.f;
     uint16_t* embed = nullptr;
-    uint16_t* xemb = nullptr;   // [TMAX][HID] bf16: media embeddings for the rows of the next block
+    uint16_t* xemb = nullptr;   // [TMAX][HID] bf16: image rows for the next block (placeholder tokens read them)
     float* norm_f = nullptr;
     TQ8 head{};
     std::vector<Layer> layers;
@@ -918,41 +915,6 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
         CK(cudaMalloc(&b->replay, tab.size() * sizeof(ReplayLayer)));
         CK(cudaMemcpy(b->replay, tab.data(), tab.size() * sizeof(ReplayLayer), cudaMemcpyHostToDevice));
     }
-    if (getenv("BOLT_VISION") && atoi(getenv("BOLT_VISION")) != 0) {
-        VisionW vw{};
-        const std::string P = "language_model.__none__";
-        (void)P;
-        const std::string V = "vision_model.radio_model.model.";
-        bool ok = true;
-        auto tbf = [&](const std::string& n) { TBF m = load_bf16(store, n); ok &= m.w != nullptr; return m; };
-        auto f32 = [&](const std::string& n) { float* p = dev_f32(store, n); ok &= p != nullptr; return p; };
-        vw.patch = tbf(V + "patch_generator.embedder.weight");
-        vw.vpatch = tbf(V + "patch_generator.video_embedder.weight");
-        {
-            Info pi; const uint8_t* pd;
-            if (lookup(store, V + "patch_generator.pos_embed", pi, pd)) vw.pos = (const uint16_t*)dev_copy(pd, pi.len); else ok = false;
-        }
-        vw.cls = f32(V + "patch_generator.cls_token.token");
-        for (int l = 0; l < VIT_LAYERS; l++) {
-            const std::string p = V + "blocks." + std::to_string(l) + ".";
-            VLayerW& L = vw.L[l];
-            L.qkv = tbf(p + "attn.qkv.weight"); L.qkv_b = f32(p + "attn.qkv.bias");
-            L.proj = tbf(p + "attn.proj.weight"); L.proj_b = f32(p + "attn.proj.bias");
-            L.fc1 = tbf(p + "mlp.fc1.weight"); L.fc1_b = f32(p + "mlp.fc1.bias");
-            L.fc2 = tbf(p + "mlp.fc2.weight"); L.fc2_b = f32(p + "mlp.fc2.bias");
-            L.n1w = f32(p + "norm1.weight"); L.n1b = f32(p + "norm1.bias");
-            L.n2w = f32(p + "norm2.weight"); L.n2b = f32(p + "norm2.bias");
-        }
-        vw.mlp_norm = f32("mlp1.0.weight");
-        vw.mlp1 = tbf("mlp1.1.weight");
-        vw.mlp2 = tbf("mlp1.3.weight");
-        if (ok) {
-            b->vision = vision_new(vw);
-            fprintf(stderr, "bolt: vision tower resident (C-RADIO v4-H, 32 layers) and projector\n");
-        } else {
-            fprintf(stderr, "bolt: the vision weights are missing or oddly shaped: images stay off\n");
-        }
-    }
     b->prof = getenv("BOLT_PROF") != nullptr;
     auto zalloc = [&](float** p, size_t floats) { CK(cudaMalloc(p, floats * 4)); CK(cudaMemset(*p, 0, floats * 4)); };
     CK(cudaMalloc(&b->xemb, (size_t)TMAX * HID * 2));
@@ -1032,34 +994,8 @@ extern "C" Bolt* bolt_load(const char* dir) {
 }
 
 
-// ---- images and video ----
-
-struct Embed { uint16_t* dev; int ntok; };
-
-extern "C" int bolt_vision_ready(Bolt* b) { return b->vision != nullptr; }
-
-// Encode one image (nframes 1) or a video (an even number of frames) on the main stream. Returns a handle to bf16
-// [ntok][4096] embeddings on the device, or null. ntok is the number of rows.
-extern "C" void* bolt_embed_new(Bolt* b, const uint8_t* const* rgb, const int* w, const int* h, int nframes, int cols, int rows, int* ntok) {
-    if (!b->vision) return nullptr;
-    cudaFree(0);
-    Embed* e = new Embed();
-    int rc = vision_encode(b->vision, rgb, w, h, nframes, cols, rows, &e->dev, &e->ntok, b->s0);
-    if (rc) { delete e; return nullptr; }
-    *ntok = e->ntok;
-    return e;
-}
-extern "C" void bolt_embed_free(void* p) {
-    Embed* e = (Embed*)p;
-    if (!e) return;
-    cudaFree(e->dev);
-    delete e;
-}
-// Test hook: fp32 intermediates of one image (see vision_debug).
-extern "C" int bolt_vision_debug(Bolt* b, const uint8_t* rgb, int w, int h, int stage, float* out, size_t cap) {
-    if (!b->vision) return -1;
-    return vision_debug(b->vision, rgb, w, h, stage, out, cap, b->s0);
-}
+// The C ABI version bolt_native.zig checks at load: bump it with any change to the calls below.
+extern "C" int bolt_abi() { return 1; }
 
 extern "C" int bolt_seqs(Bolt* b) { return b->nseq; }
 extern "C" int bolt_context(Bolt* b) { return b->context; }
@@ -1201,12 +1137,12 @@ extern "C" int bolt_prefill_seq(Bolt* b, int seq, const int* tokens, int n, int 
 }
 
 
-// A run of prompt tokens whose embeddings come from a vision handle: tokens[pos .. pos + count) of the call take rows
-// [row, row + count) of embed (from bolt_embed_new).
-struct BoltMediaRun { int pos, count; void* embed; int row; };
+// A run of prompt tokens whose embeddings are rows already on the device: tokens[pos .. pos + count) of the call take
+// the bf16 [count][4096] rows at `rows`.
+struct BoltRowRun { int pos, count; const void* rows; };
 
-// bolt_prefill_seq with media: the tokens in the runs are placeholders (any id); their rows are replaced by the embeddings.
-extern "C" int bolt_prefill_seq_media(Bolt* b, int seq, const int* tokens, int n, int cand_k, const BoltMediaRun* runs, int nruns) {
+// bolt_prefill_seq with image rows: the tokens in the runs are placeholders (any id); their rows are replaced.
+extern "C" int bolt_prefill_seq_rows(Bolt* b, int seq, const int* tokens, int n, int cand_k, const BoltRowRun* runs, int nruns) {
     int done = 0;
     std::vector<int> toks(tokens, tokens + n);
     std::vector<EmbedPatch> patches;
@@ -1216,8 +1152,7 @@ extern "C" int bolt_prefill_seq_media(Bolt* b, int seq, const int* tokens, int n
         for (int i = 0; i < nruns; i++) {
             const int lo = std::max(runs[i].pos, done), hi = std::min(runs[i].pos + runs[i].count, done + t);
             if (hi <= lo) continue;
-            const Embed* e = (const Embed*)runs[i].embed;
-            patches.push_back({lo - done, e->dev + (size_t)(runs[i].row + lo - runs[i].pos) * HID, hi - lo});
+            patches.push_back({lo - done, (const uint16_t*)runs[i].rows + (size_t)(lo - runs[i].pos) * HID, hi - lo});
             for (int p = lo; p < hi; p++) toks[p] = -1;
         }
         const int last = done + t == n;
@@ -1225,6 +1160,7 @@ extern "C" int bolt_prefill_seq_media(Bolt* b, int seq, const int* tokens, int n
         if (rc) return rc;
         done += t;
     }
+    CK(cudaStreamSynchronize(b->s0));   // the caller reuses its rows buffer for the next piece
     return 0;
 }
 

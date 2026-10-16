@@ -1,34 +1,38 @@
-//! Nemotron 3.5 Bolt on the native CUDA host. libbolt.so does the forward; this file is the lane backend over it:
-//! prompt pass, verify windows, rollback, the LiLiCorr drafts it holds for the next round, and the keyed draws.
-//! libbolt keeps BOLT_SEQS independent sequences; each live stream owns one, and a shared round carries every stream's
-//! window in one forward.
+//! Nemotron 3.5 Bolt's lane backend over libbolt.so: prompts, shared verify windows, rollback, drafts, keyed draws.
 const std = @import("std");
 const lanes = @import("lanes");
 const reuse = @import("cuda_reuse.zig");
 const cuda = @import("cuda");
+const radio = @import("radio");
+const native = @import("cuda_native.zig");
+pub const vision = native.vision;
 
-pub const model_type = "nemotron_h_omni";
+pub const model_type = "nemotron_h_puzzle";
 pub const formats: []const []const u8 = &.{"modelopt-mixed"};
 pub const default_context: i64 = 262144;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = 2048;
 pub const lone_min_budget: u64 = 0;
+pub const explains_open = true; // explain() words open refusals too (--vision on a checkpoint without a tower)
 pub const warm_quiet: u64 = 0;
+/// No head reads a token ahead of a prompt: a state keys at its own row.
+pub const snap_lookahead: u32 = 0;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, lanes: u32 = 1 };
 
 /// Rows a verify window carries at most: the pending token and seven drafts.
 const window: u32 = 8;
-/// Prompt rows a cancel or yield waits for at most, and the piece while other streams are decoding (their rounds run
-/// between pieces).
+/// Prompt rows a cancel waits for at most, and the smaller piece while other streams decode.
 const piece_rows: usize = 2048;
 const busy_piece_rows: usize = 512;
 /// Streams and rows one shared forward carries (libbolt's SEG_MAX and BATCH_MAX).
 const max_segs: usize = 16;
 const max_batch: u32 = 128;
-/// Picture runs one prompt piece may hold, and frames one video may have.
-const media_runs_max = 64;
-const max_frames = 512;
+/// Image spans a prompt piece may cross, and the rows its images take together (a piece cuts two 3,328-token images).
+const max_runs = 64;
+const image_rows: u32 = 16384;
+/// The C ABI version of libbolt this backend speaks (`bolt_abi`).
+const abi_version: c_int = 1;
 /// Candidates kept per row for the keyed draw.
 const cand_max: usize = 64;
 
@@ -38,6 +42,7 @@ const prior = [_]f64{ 0.80, 0.78, 0.76, 0.74, 0.72, 0.70, 0.68 };
 extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
 extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
 extern "c" fn dlerror() ?[*:0]const u8;
+extern "c" fn readlink(path: [*:0]const u8, buf: [*]u8, len: usize) isize;
 const Timespec = extern struct { sec: i64, nsec: i64 };
 extern "c" fn clock_gettime(clk: c_int, ts: *Timespec) c_int;
 fn nowMs() f64 {
@@ -47,8 +52,8 @@ fn nowMs() f64 {
 }
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
-/// A run of prompt tokens whose rows come from a picture's embeddings (bolt_prefill_seq_media).
-const MediaRun = extern struct { pos: c_int, count: c_int, embed: ?*anyopaque, row: c_int };
+/// A run of a prompt piece whose embeddings are rows on the device (bolt_prefill_seq_rows).
+const RowRun = extern struct { pos: c_int, count: c_int, rows: u64 };
 
 /// libbolt's C ABI, resolved once.
 const Api = struct {
@@ -67,14 +72,8 @@ const Api = struct {
     propose: *const fn (?*anyopaque, c_int, c_int, [*]c_int) callconv(.c) c_int,
     propose_multi: *const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]c_int, [*]c_int) callconv(.c) void,
     has_draft: *const fn (?*anyopaque) callconv(.c) c_int,
-    vision_ready: *const fn (?*anyopaque) callconv(.c) c_int,
-    image_decode: *const fn ([*]const u8, usize, *?[*]u8, *c_int, *c_int) callconv(.c) c_int,
-    free_host: *const fn (?*anyopaque) callconv(.c) void,
-    image_grid: *const fn (c_int, c_int, *c_int, *c_int) callconv(.c) c_int,
-    embed_new: *const fn (?*anyopaque, [*]const [*]const u8, [*]const c_int, [*]const c_int, c_int, c_int, c_int, *c_int) callconv(.c) ?*anyopaque,
-    embed_free: *const fn (?*anyopaque) callconv(.c) void,
-    video_decode: *const fn ([*]const u8, usize, f64, c_int, *?[*]u8, *c_int, *c_int, *c_int, *?[*]f32, *c_int, *c_int, *c_int) callconv(.c) c_int,
-    prefill_media: *const fn (?*anyopaque, c_int, [*]const c_int, c_int, c_int, [*]const MediaRun, c_int) callconv(.c) c_int,
+    abi: *const fn () callconv(.c) c_int,
+    prefill_rows: *const fn (?*anyopaque, c_int, [*]const c_int, c_int, c_int, [*]const RowRun, c_int) callconv(.c) c_int,
     cost: *const fn (?*anyopaque, c_int) callconv(.c) f64,
     draft_multi_cost: *const fn (?*anyopaque) callconv(.c) f64,
     shared_costs: *const fn (?*anyopaque, [*]c_int, [*]f64, c_int) callconv(.c) c_int,
@@ -100,14 +99,8 @@ const Api = struct {
             .propose = try sym(*const fn (?*anyopaque, c_int, c_int, [*]c_int) callconv(.c) c_int, handle, "bolt_propose_seq"),
             .propose_multi = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]c_int, [*]c_int) callconv(.c) void, handle, "bolt_propose_multi"),
             .has_draft = try sym(*const fn (?*anyopaque) callconv(.c) c_int, handle, "bolt_has_draft"),
-            .vision_ready = try sym(*const fn (?*anyopaque) callconv(.c) c_int, handle, "bolt_vision_ready"),
-            .image_decode = try sym(*const fn ([*]const u8, usize, *?[*]u8, *c_int, *c_int) callconv(.c) c_int, handle, "bolt_image_decode"),
-            .free_host = try sym(*const fn (?*anyopaque) callconv(.c) void, handle, "bolt_free_host"),
-            .image_grid = try sym(*const fn (c_int, c_int, *c_int, *c_int) callconv(.c) c_int, handle, "bolt_image_grid"),
-            .embed_new = try sym(*const fn (?*anyopaque, [*]const [*]const u8, [*]const c_int, [*]const c_int, c_int, c_int, c_int, *c_int) callconv(.c) ?*anyopaque, handle, "bolt_embed_new"),
-            .embed_free = try sym(*const fn (?*anyopaque) callconv(.c) void, handle, "bolt_embed_free"),
-            .video_decode = try sym(*const fn ([*]const u8, usize, f64, c_int, *?[*]u8, *c_int, *c_int, *c_int, *?[*]f32, *c_int, *c_int, *c_int) callconv(.c) c_int, handle, "bolt_video_decode"),
-            .prefill_media = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, c_int, c_int, [*]const MediaRun, c_int) callconv(.c) c_int, handle, "bolt_prefill_seq_media"),
+            .abi = try sym(*const fn () callconv(.c) c_int, handle, "bolt_abi"),
+            .prefill_rows = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, c_int, c_int, [*]const RowRun, c_int) callconv(.c) c_int, handle, "bolt_prefill_seq_rows"),
             .cost = try sym(*const fn (?*anyopaque, c_int) callconv(.c) f64, handle, "bolt_cost"),
             .draft_multi_cost = try sym(*const fn (?*anyopaque) callconv(.c) f64, handle, "bolt_draft_multi_cost"),
             .shared_costs = try sym(*const fn (?*anyopaque, [*]c_int, [*]f64, c_int) callconv(.c) c_int, handle, "bolt_shared_costs"),
@@ -135,8 +128,6 @@ const Slot = struct {
     decoding: bool = false, // the prompt pass is over
     held: [window]u32 = @splat(0), // the drafts held for the stream's next window
     held_n: u32 = 0,
-    media: ?*const lanes.media.MediaSet = null, // the stream's pictures
-    embeds: []?*anyopaque = &.{}, // their embeddings in libbolt, encoded when the pass first needs them
 };
 
 /// Draws wait here between the forward and the round loop reading them back.
@@ -155,6 +146,8 @@ const Engine = struct {
     stat_on: bool = false, // BOLT_STATS: log the round loop's time in the backend every 100 windows
     stat: struct { rounds: u32 = 0, streams: u32 = 0, rows: u32 = 0, verify: f64 = 0, draw: f64 = 0, draft: f64 = 0, keep: f64 = 0 } = .{},
     target: reuse.Target = undefined,
+    vision: ?*vision.Vision = null, // --vision: the RADIO tower and a rows buffer one prompt piece uses
+    stream: ?cuda.Stream = null, // the stream the tower runs on
 
     /// Candidates the keyed draw needs for this stream's sampling: 1 when greedy.
     fn candCount(s: *const lanes.Stream) c_int {
@@ -194,17 +187,12 @@ const Engine = struct {
 
     /// Take a sequence for the stream and resume it from a kept prompt state when the cache has one for its prefix.
     fn begin(e: *Engine, s: *lanes.Stream) !*Slot {
+        if (s.images.len > 0 and e.vision == null) return error.NoVision;
         const seq = e.api.seq_alloc(e.model);
         if (seq < 0) return error.LaneMemory; // every sequence is in use: the stream waits at the queue's head
         const slot = try e.gpa.create(Slot);
         errdefer e.gpa.destroy(slot);
         slot.* = .{ .seq = seq };
-        if (s.media) |ms| {
-            slot.media = ms;
-            slot.embeds = try e.gpa.alloc(?*anyopaque, ms.items.len);
-            @memset(slot.embeds, null);
-        }
-        errdefer if (slot.embeds.len > 0) e.gpa.free(slot.embeds);
         errdefer e.api.seq_release(e.model, seq);
         try e.slots.put(e.gpa, s, slot);
         errdefer _ = e.slots.remove(s);
@@ -225,8 +213,7 @@ const Engine = struct {
         return slot;
     }
 
-    /// One piece of the prompt pass, cut at the cache's marks so the lane host can keep the state there. Small enough
-    /// that a cancel or a background yield lands quickly, and smaller still while other streams are decoding.
+    /// One piece of the prompt pass, cut at the cache's marks, small enough that a cancel lands quickly.
     fn prefillStep(ptr: *anyopaque, s: *lanes.Stream) !bool {
         const e: *Engine = @ptrCast(@alignCast(ptr));
         const prompt_len = s.prompt().len;
@@ -239,77 +226,49 @@ const Engine = struct {
             if (m > slot.at and m < end) end = m;
         }
         const last = end == prompt_len;
-        var runs: [media_runs_max]MediaRun = undefined;
-        var nruns: usize = 0;
-        if (slot.media) |ms| {
-            for (ms.items, 0..) |item, i| {
-                var row: u32 = 0;
-                for (item.runs) |run| {
-                    const lo: usize = @max(@as(usize, run[0]), slot.at);
-                    const hi: usize = @min(@as(usize, run[0]) + run[1], end);
-                    if (hi > lo) {
-                        if (nruns == runs.len) return error.BoltForward;
-                        if (slot.embeds[i] == null) try e.encode(slot, item, i);
-                        runs[nruns] = .{ .pos = @intCast(lo - slot.at), .count = @intCast(hi - lo), .embed = slot.embeds[i], .row = @intCast(@as(usize, row) + (lo - run[0])) };
-                        nruns += 1;
-                    }
-                    row += run[1];
-                }
-            }
-        }
         const cand: c_int = if (last) candCount(s) else 0;
+        var runs: [max_runs]RowRun = undefined;
+        const nruns = if (s.images.len > 0) try e.imageRuns(s, slot.at, end, &runs) else 0;
         const rc = if (nruns > 0)
-            e.api.prefill_media(e.model, slot.seq, slot.ids.ptr + slot.at, @intCast(end - slot.at), cand, &runs, @intCast(nruns))
+            e.api.prefill_rows(e.model, slot.seq, slot.ids.ptr + slot.at, @intCast(end - slot.at), cand, &runs, @intCast(nruns))
         else
             e.api.prefill(e.model, slot.seq, slot.ids.ptr + slot.at, @intCast(end - slot.at), cand);
         if (rc != 0) return error.BoltForward;
         slot.at = end;
-        // a picture the pass has gone beyond gives its rows back now: fifty pictures need not sit on the device together
-        if (slot.media) |ms| for (ms.items, 0..) |item, i| {
-            if (slot.embeds[i] == null or item.runs.len == 0) continue;
-            const tail = item.runs[item.runs.len - 1];
-            if (@as(usize, tail[0]) + tail[1] <= slot.at) {
-                e.api.embed_free(slot.embeds[i]);
-                slot.embeds[i] = null;
-            }
-        };
         if (s.reuse.hook) |hk| {
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(slot.at)) != null) hk.at(hk.ptr, s, @intCast(slot.at));
         }
         if (!last) return false;
         e.gpa.free(slot.ids);
         slot.ids = &.{};
-        e.dropEmbeds(slot);
         slot.decoding = true;
         e.decoding += 1;
         return true;
     }
 
-    /// Run a picture through the vision tower and projector; its rows stay on the device until the prompt pass is beyond the picture.
-    fn encode(e: *Engine, slot: *Slot, item: lanes.media.Media, index: usize) !void {
-        var ptrs: [max_frames][*]const u8 = undefined;
-        var ws: [max_frames]c_int = undefined;
-        var hs: [max_frames]c_int = undefined;
-        if (item.frames.len == 0 or item.frames.len > max_frames) return error.BoltForward;
-        for (item.frames, 0..) |f, k| {
-            ptrs[k] = f.rgb.ptr;
-            ws[k] = @intCast(f.width);
-            hs[k] = @intCast(f.height);
+    /// The images rows [lo, hi) cross, encoded into the rows buffer, and the runs libbolt reads (a cut one is redone).
+    fn imageRuns(e: *Engine, s: *const lanes.Stream, lo: usize, hi: usize, runs: []RowRun) !usize {
+        const v = e.vision orelse return error.NoVision;
+        const st = e.stream.?;
+        const row_bytes = v.rows.hidden * 2;
+        var top: u32 = 0;
+        var n: usize = 0;
+        for (s.images) |img| {
+            const a: usize = img.at;
+            const b = a + img.tokens;
+            if (b <= lo) continue;
+            if (a >= hi) break; // in prompt order
+            if (n == runs.len or top + img.tokens > v.rows.limit) return error.ImageRows;
+            const base = v.rows.buf.ptr + @as(u64, top) * row_bytes;
+            try v.tower.picture(st, img, base);
+            const from = @max(lo, a);
+            const to = @min(hi, b);
+            runs[n] = .{ .pos = @intCast(from - lo), .count = @intCast(to - from), .rows = base + @as(u64, @intCast(from - a)) * row_bytes };
+            n += 1;
+            top += img.tokens;
         }
-        var ntok: c_int = 0;
-        const h = e.api.embed_new(e.model, &ptrs, &ws, &hs, @intCast(item.frames.len), @intCast(item.cols), @intCast(item.rows), &ntok) orelse return error.BoltVision;
-        if (ntok != @as(c_int, @intCast(item.tokens))) {
-            e.api.embed_free(h);
-            return error.BoltVision;
-        }
-        slot.embeds[index] = h;
-    }
-
-    fn dropEmbeds(e: *Engine, slot: *Slot) void {
-        for (slot.embeds) |h| if (h != null) e.api.embed_free(h);
-        if (slot.embeds.len > 0) e.gpa.free(slot.embeds);
-        slot.embeds = &.{};
-        slot.media = null;
+        if (n > 0) try st.synchronize(); // the rows are whole before libbolt copies them
+        return n;
     }
 
     fn prefill(ptr: *anyopaque, s: *lanes.Stream) !void {
@@ -401,8 +360,7 @@ const Engine = struct {
         e.stat.keep += nowMs() - t0;
     }
 
-    /// Hold the drafts for each stream's next window: LiLiCorr over the kept rows and the token that follows them, for
-    /// every stream of the batch in one pass over the drafter's weights.
+    /// Hold each stream's drafts for its next window: LiLiCorr over every stream's kept rows in one pass.
     fn draft(ptr: *anyopaque, requests: []const lanes.backend.DraftRequest) !void {
         const e: *Engine = @ptrCast(@alignCast(ptr));
         const t0 = nowMs();
@@ -446,7 +404,6 @@ const Engine = struct {
         const kv = e.slots.fetchRemove(s) orelse return;
         const slot = kv.value;
         if (slot.decoding) e.decoding -|= 1;
-        e.dropEmbeds(slot);
         e.api.seq_release(e.model, slot.seq);
         if (slot.ids.len > 0) e.gpa.free(slot.ids);
         e.gpa.destroy(slot);
@@ -470,79 +427,6 @@ const Engine = struct {
     }
 };
 
-// -- pictures: the hooks the server uses to decode them and lay them out in the prompt ----
-
-fn mediaImage(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8) anyerror!lanes.media.Media {
-    const e: *Engine = @ptrCast(@alignCast(ctx));
-    var rgb: ?[*]u8 = null;
-    var w: c_int = 0;
-    var h: c_int = 0;
-    if (e.api.image_decode(bytes.ptr, bytes.len, &rgb, &w, &h) != 0) return error.BadImage;
-    defer e.api.free_host(rgb);
-    const n = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 3;
-    const copy = try a.dupe(u8, rgb.?[0..n]);
-    var cols: c_int = 0;
-    var rows: c_int = 0;
-    const tokens = e.api.image_grid(w, h, &cols, &rows);
-    const frames = try a.alloc(lanes.media.Picture, 1);
-    frames[0] = .{ .rgb = copy, .width = @intCast(w), .height = @intCast(h) };
-    return .{ .kind = .image, .frames = frames, .cols = @intCast(cols), .rows = @intCast(rows), .tokens = @intCast(tokens) };
-}
-
-fn mediaVideo(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8) anyerror!lanes.media.Media {
-    const e: *Engine = @ptrCast(@alignCast(ctx));
-    var rgb: ?[*]u8 = null;
-    var times: ?[*]f32 = null;
-    var nframes: c_int = 0;
-    var w: c_int = 0;
-    var h: c_int = 0;
-    var ntimes: c_int = 0;
-    var cols: c_int = 0;
-    var rows: c_int = 0;
-    if (e.api.video_decode(bytes.ptr, bytes.len, 0, 0, &rgb, &nframes, &w, &h, &times, &ntimes, &cols, &rows) != 0) return error.BadVideo;
-    defer e.api.free_host(rgb);
-    defer e.api.free_host(times);
-    const frame_bytes = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 3;
-    const n: usize = @intCast(nframes);
-    const all = try a.dupe(u8, rgb.?[0 .. frame_bytes * n]);
-    const frames = try a.alloc(lanes.media.Picture, n);
-    for (frames, 0..) |*f, i| f.* = .{ .rgb = all[i * frame_bytes .. (i + 1) * frame_bytes], .width = @intCast(w), .height = @intCast(h) };
-    const stamps = try a.dupe(f32, times.?[0..@intCast(ntimes)]);
-    const groups: u32 = @intCast(n / 2);
-    const per: u32 = @intCast(@divExact(cols * rows, 4));
-    return .{ .kind = .video, .frames = frames, .cols = @intCast(cols), .rows = @intCast(rows), .tokens = groups * per, .groups = groups, .times = stamps };
-}
-
-/// The chat template writes `<image N><image>` for several pictures in a message and `<image>` for one; the processor
-/// then expands each `<image>` to `<img>` + the placeholders + `</img>`.
-fn mediaText(ctx: *anyopaque, a: std.mem.Allocator, item: *const lanes.media.Media, index: u32, count: u32) anyerror![]const u8 {
-    _ = ctx;
-    var out: std.ArrayList(u8) = .empty;
-    if (item.kind == .image) {
-        if (count > 1) try out.print(a, "<image {d}>", .{index + 1});
-        try out.appendSlice(a, "<img>");
-        for (0..item.tokens) |_| try out.appendSlice(a, "<image>");
-        try out.appendSlice(a, "</img>");
-        return out.items;
-    }
-    // a video: each tubelet (two frames) is "Frame i sampled at t seconds and frame j sampled at u seconds: " + <img>...</img>,
-    // the tubelets on lines of their own (processing_nemotron_h_omni.py)
-    const per = item.tokens / item.groups;
-    for (0..item.groups) |g| {
-        if (g > 0) try out.append(a, '\n');
-        for (0..2) |j| {
-            const fi = g * 2 + j;
-            if (fi >= item.times.len) break;
-            if (j > 0) try out.appendSlice(a, " and ");
-            try out.print(a, "{s} {d} sampled at {d:.2} seconds", .{ if (j == 0) "Frame" else "frame", fi + 1, item.times[fi] });
-        }
-        try out.appendSlice(a, ": <img>");
-        for (0..per) |_| try out.appendSlice(a, "<image>");
-        try out.appendSlice(a, "</img>");
-    }
-    return out.items;
-}
-
 pub const Loaded = struct {
     backend: lanes.backend.Backend,
     facts: lanes.Model,
@@ -555,12 +439,14 @@ pub const Loaded = struct {
     target: *reuse.Target,
     learns: ?*@import("cuda_engine.zig").Engine = null,
     learn_bytes: usize = 0,
-    media: ?lanes.media.Hooks = null,
+    vision: ?*vision.Vision = null,
 };
 
 fn shutdown(p: *anyopaque) void {
     const e: *Engine = @ptrCast(@alignCast(p));
     e.api.free(e.model);
+    if (e.vision) |v| v.deinit();
+    if (e.stream) |*st| st.deinit();
     e.slots.deinit(e.gpa);
     e.gpa.destroy(e);
 }
@@ -597,15 +483,49 @@ pub fn snap_drop(ptr: *anyopaque, saved: *anyopaque) void {
 var costs: [window]lanes.config.Cost = undefined;
 var shared: [32]lanes.config.Cost = undefined;
 
+/// libbolt.so: TENSORFOLD_BOLT_LIB, else beside the server (native/lib), else the loader's path.
+fn openLibrary() ?*anyopaque {
+    if (std.c.getenv("TENSORFOLD_BOLT_LIB")) |p| return dlopen(p, 2);
+    var exe: [std.fs.max_path_bytes]u8 = undefined;
+    const n = readlink("/proc/self/exe", &exe, exe.len - 1);
+    if (n > 0) {
+        const dir = std.fs.path.dirname(exe[0..@intCast(n)]) orelse "";
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (std.fmt.bufPrintSentinel(&buf, "{s}/../lib/libbolt.so", .{dir}, 0)) |path| {
+            if (dlopen(path, 2)) |h| return h;
+        } else |_| {}
+    }
+    return dlopen("libbolt.so", 2);
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
-    _ = io;
-    _ = ctx;
     _ = kernels;
-    const handle = dlopen("/opt/tensorfold/lib/libbolt.so", 2) orelse {
-        std.log.err("bolt: dlopen {s}", .{if (dlerror()) |m| std.mem.span(m) else "failed"});
+    // --vision: the RADIO tower and its rows buffer, before the language model takes its memory
+    var tower: ?*vision.Vision = null;
+    var problem: []const u8 = "";
+    if (o.vision) |lim| {
+        // the rows buffer holds one prompt piece's images; the request's token total is the server's limit alone
+        tower = (try vision.Vision.init(gpa, io, ctx.d, dir, .{ .image_tokens = @min(lim.image_tokens, image_rows), .max_images = lim.max_images }, &problem)) orelse {
+            std.log.err("--vision: {s}", .{problem});
+            return error.VisionRefused;
+        };
+        tower.?.limits.image_tokens = lim.image_tokens;
+    }
+    errdefer if (tower) |v| v.deinit();
+    var stream: ?cuda.Stream = if (tower != null) try cuda.Stream.init(ctx.d, false) else null;
+    errdefer if (stream) |*st| st.deinit();
+    const handle = openLibrary() orelse {
+        std.log.err("bolt: libbolt.so: {s} (zig build bolt -Dnvcc=NVCC installs it beside the server)", .{if (dlerror()) |m| std.mem.span(m) else "not found"});
         return error.BoltMissing;
     };
     const api = try Api.load(handle);
+    if (api.abi() != abi_version) {
+        std.log.err("bolt: libbolt.so speaks ABI {d}, this server {d}: build it from the same source", .{ api.abi(), abi_version });
+        return error.BoltMissing;
+    }
+    // one libbolt sequence a stream (--parallel), unless BOLT_SEQS says otherwise
+    var seqs_buf: [16]u8 = undefined;
+    _ = setenv("BOLT_SEQS", std.fmt.bufPrintSentinel(&seqs_buf, "{d}", .{o.lanes}, 0) catch "1", 0);
     // no drafter checkpoint is read (or its memory held) when the server runs --no-drafts
     if (!o.drafts) _ = setenv("BOLT_DRAFT_OFF", "1", 1);
     const path = try gpa.allocSentinel(u8, dir.len, 0);
@@ -614,7 +534,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const model = api.open(path, @intCast(o.context)) orelse return error.BoltLoad;
     const e = try gpa.create(Engine);
     const nseq: u32 = @intCast(@max(1, api.seqs(model)));
-    e.* = .{ .gpa = gpa, .api = api, .model = model, .drafts = o.drafts and api.has_draft(model) != 0, .seqs = nseq, .stat_on = std.c.getenv("BOLT_STATS") != null };
+    e.* = .{ .gpa = gpa, .api = api, .model = model, .drafts = o.drafts and api.has_draft(model) != 0, .seqs = nseq, .stat_on = std.c.getenv("BOLT_STATS") != null, .vision = tower, .stream = stream };
     for (0..window) |i| costs[i] = .{ .width = @intCast(i + 1), .ms = api.cost(model, @intCast(i + 1)) };
     const propose_ms = api.cost(model, 0);
     const propose_multi_ms = api.draft_multi_cost(model);
@@ -649,15 +569,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .ctx = e,
         .deinit = shutdown,
         .target = @ptrCast(@alignCast(e)), // the prompt cache's opaque handle: the engine itself
-        .media = if (api.vision_ready(model) != 0) .{
-            .ctx = e,
-            .image = mediaImage,
-            .video = mediaVideo,
-            .text = mediaText,
-            .placeholder = 18, // <image>
-            .salt_first = 100, // <SPECIAL_70> ... <SPECIAL_999>, which no text produces
-            .salt_count = 900,
-        } else null,
+        .vision = tower,
     };
 }
 
@@ -665,6 +577,8 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.BoltLoad => "Bolt could not read this checkpoint",
         error.BoltForward => "Bolt's forward failed",
+        error.VisionRefused => "--vision: this checkpoint has no image tower Bolt reads (the RADIO tower of an omni checkpoint); serve it without --vision",
+        error.NoVision => "this server reads no images: start it with --vision",
         error.WindowTooWide => "Bolt verifies chains of up to eight rows a stream, sixteen streams at a time",
         else => null,
     };

@@ -1,8 +1,8 @@
 # The Bolt backend and engine
 
-`./start.sh` builds TensorFold at `c7137bb3`, applies `patches/`, copies `engine/bolt_native.zig` into
+`./start.sh` builds TensorFold at `46a08c18`, applies `patches/`, copies `engine/bolt_native.zig` into
 `zig/src/families/nemotron/` and compiles `engine/*.cu` into `/opt/tensorfold/lib/libbolt.so`. `tensorfold-native`
-opens the checkpoint through the `nemotron_h_omni` entry that `patches/0002` registers, `dlopen`s libbolt and serves.
+opens the checkpoint through the `nemotron_h_puzzle` family that `patches/0002` registers, loads libbolt from its own `lib/` and serves.
 
 ## Why a separate library
 
@@ -56,29 +56,20 @@ recurrent state. Extra jobs beyond N queue.
   attention on bf16 mma with online softmax (`attn_mma_part_k`; for windows one CTA is one stream's window).
 - `bolt_kernels.cu`: norms, the Mamba conv and scan (a row-parallel conv and a thread-pair scan for long blocks, a
   warp-per-channel scan for windows), the router, the routed experts on int8 tensor cores, candidate selection.
-- `bolt_vision.cu`: the image and video tower and its decoders (below).
 - `bolt_draft.cu`: the LiLiCorr drafter: five DFlash layers (grouped conv, sliding-window sink attention, NVFP4 MLP)
   over the six captured residuals, then the candidate lattice and its greedy walk. A call drafts for up to 16 streams;
   the kept rows of every stream are ingested in one pass too.
 
-### Images and video (`bolt_vision.cu`)
+### Images and video
 
-With `BOLT_VISION=1` the loader also reads `vision_model.*` and `mlp1.*` (1.68 GB bf16) and the C API gains
-`bolt_image_decode` (stb_image), `bolt_video_decode` (ffprobe and ffmpeg through a temp file; frames come back already
-resized), `bolt_embed_new/free` and `bolt_prefill_seq_media`. The pieces, checked against the checkpoint's
-`modeling_radio.py` and `modeling_nemotron_h_omni.py` (the final embeddings match a PyTorch reference to 4.5e-3 relative L2):
-
-- **Resize**: the processor's grid rule (1,024 to 13,312 patches of 16 px, aspect kept, Python's banker's rounding),
-  then antialiased bicubic with torch's weights built on the host, two passes on the GPU, normalize and patchify fused.
-- **Tower**: patch embedding (a GEMM), the cropped position embedding (the 128×128 table resampled to the larger side
-  and cropped), ten prefix tokens, 32 pre-norm blocks of LayerNorm, QKV, bidirectional attention
-  (`vit_attn_k`, mma flash attention at head dim 80) and a GELU MLP, on the same `mma_bf16` GEMMs as the language model.
-- **Projector**: drop the prefix, 2×2 pixel shuffle, RMSNorm, `mlp1.1` (5120 to 20480), ReLU², `mlp1.3` (20480 to 4096).
-  A video group of two frames uses `video_embedder` (1280×1536) and the same tower.
-- **Splice**: the prompt holds `<image>` (id 18) placeholders, salted to ids 100..999 by the server so the prompt cache
-  keys differ per picture. The backend hands `bolt_prefill_seq_media` runs of `{pos, count, embed, row}`; `k_embed`
-  reads a negative token as a row of that embedding buffer. The buffers are freed after the last prompt piece.
-  The language model treats the rows as ordinary positions (causal), as in the reference.
+TensorFold's RADIO tower (`families/radio`) encodes pictures; libbolt only takes their rows. The backend reads each prompt
+piece's images (`Request.images`: patches, grid, the placeholder row they start at) and, for the images the piece
+crosses, runs the tower into a 16,384-row rows buffer and calls `bolt_prefill_seq_rows` with runs of
+`{pos, count, device pointer}`. libbolt copies each run over the block's embedding rows before the layer graph and
+reads placeholder tokens (`<image>`) as those rows; it synchronizes its stream before returning, so the next piece
+reuses the buffer. An image a piece cuts is encoded again by the next piece, which keeps streams independent: no image
+state lives between pieces, so several image prompts interleave. A video is the same: each pair of sampled frames is
+one tower input whose patches hold both frames, through the checkpoint's `video_embedder` projection.
 
 ### State of a sequence
 

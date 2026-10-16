@@ -35,11 +35,10 @@ TensorFold commit.
 
 TensorFold's Nemotron family serves Lightning 30B-A3B; this checkpoint is `nemotron_h_puzzle` (hidden 4096, 88
 blocks, per-layer expert counts, IQ2_XXS experts). `patches/0002-register-bolt.patch` registers a Bolt backend,
-`engine/bolt_native.zig`, in the native CUDA host. The backend is a TensorFold *lane backend*: the HTTP server, chat
+`engine/bolt_native.zig`, in the native CUDA host, as the family `nemotron_h_puzzle`. The backend is a TensorFold *lane backend*: the HTTP server, chat
 template, thinking budget, round loop, stop handling and keyed sampler are TensorFold's own. The forward pass lives in
 `libbolt.so` (`engine/*.cu`), loaded with `dlopen`, because the native kernels only cover Lightning's shapes.
-`patches/0001` keeps Lightning's parser from claiming a Bolt checkpoint. `./start.sh` checks the snapshot against
-[`contract/bolt.json`](contract/bolt.json) and serves it.
+`./start.sh` checks the snapshot against [`contract/bolt.json`](contract/bolt.json) and serves it.
 
 ## Speed
 
@@ -189,7 +188,7 @@ cd Nemotron-3.5-Bolt-TensorFold-DGX-Spark
 ./start.sh
 ```
 
-The first run builds TensorFold at `c7137bb3` with `patches/` and the engine in `engine/`, downloads the checkpoint
+The first run builds TensorFold at `46a08c18` (1.0.12) with `patches/` and the engine in `engine/`, downloads the checkpoint
 (23 GiB) and the LiLiCorr drafter (1.3 GB), checks them, starts the server and sends a smoke request. Later runs
 reuse the image and the snapshots. Loading takes about 45 seconds with the files in the page cache.
 
@@ -223,7 +222,7 @@ defaults (`./start.sh restart --context 131072`). `DRY_RUN=1` prints the docker 
 **`scripts/prepare.sh`:**
 
 1. Preflight: Docker, disk, `MemAvailable`.
-2. The image `tensorfold-nemotron-bolt:zig-c7137bb`: TensorFold at `TF_REF` with every `patches/*.patch` applied,
+2. The image `tensorfold-nemotron-bolt:zig-46a08c1`: TensorFold at `TF_REF` with every `patches/*.patch` applied,
    `zig test zig/src/families/nemotron/config.zig`, Zig 0.17.0, on `nvcr.io/nvidia/pytorch:26.07-py3`, then
    `zig build -Dnvcc=… install native`. It tries a prebuilt image from GitHub Container Registry first
    (`PULL=0` builds locally). No image is published for this revision, so the first run builds.
@@ -254,7 +253,7 @@ would pass it fails instead of freezing the machine. The prompt cache (`PROMPT_C
 
 `KV_PIN=1` maps the full window of every stream at load instead (`PARALLEL` × `CONTEXT` × 8 KB in bf16, half that with
 `KV_DTYPE=fp8`), so the memory is certain and a start that cannot have it fails at once. Vision adds the tower's
-1.7 GB and a scratch that grows with the largest picture.
+1.7 GB, a 134 MB rows buffer and the tower's scratch (about 1 GiB at the largest picture).
 
 `prepare.sh` and `start.sh` refuse to run when `MemAvailable` is under 10 GiB (`MEM_FLOOR_GIB`). Keep at least
 10 GiB free under load. On this machine, exhausting unified memory freezes it. A smaller `PARALLEL` or `CONTEXT` is the
@@ -278,7 +277,10 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `MAX_TOKENS` | `32768` | the reply budget when a request sets none |
 | `KV_PIN` | `0` | `1` maps every stream's whole `CONTEXT` window at load and keeps it: `PARALLEL` × `CONTEXT` × 8 KB (bf16) or 4.1 KB (fp8), e.g. 8 × 262,144 = 16 GiB. The memory is then certain, and a start that cannot have it fails at once, naming `PARALLEL`, `CONTEXT` and `KV_DTYPE` |
 | `KV_DTYPE` | `bf16` | `fp8` stores K and V as e4m3 with an fp32 scale per token and head: 4.1 KB a token instead of 8 KB, so twice the tokens in the same memory and half the prompt-cache bytes. Passed to libbolt as `BOLT_KV` (the native server itself refuses `--kv-dtype`). No speed cost; see below |
-| `VISION` | `1` | loads the C-RADIO tower and projector (1.7 GB) so requests can carry images and video. `0` serves text only and skips the weights. Passed to libbolt as `BOLT_VISION`; the native server's own `--vision*` flags are not used |
+| `VISION` | `1` | loads TensorFold's RADIO tower and projector (1.7 GB) so requests can carry images and video: `--vision` and the four limits below. `0` serves text only and skips the weights |
+| `VISION_MAX_IMAGES` / `VISION_MAX_VIDEOS` | `64` / `4` | pictures and clips one request may hold |
+| `VISION_IMAGE_TOKENS` / `VISION_VIDEO_TOKENS` | `262144` / `131072` | the visual tokens a request's images (and its videos) share; each gets an equal part of its total |
+| `VISION_URLS` | `0` | `1` also fetches public HTTPS image and video URLs (`--vision-urls`) |
 | `SERVED_NAME` | `Nemotron-3.5-Bolt` | the model id in `/v1/models` |
 | `PORT` / `HOST` | `8888` / `0.0.0.0` | where the API listens |
 | `TENSORFOLD_MEMORY_RESERVE_GIB` | `10` | the floor `prepare.sh` and `start.sh` refuse to start below |
@@ -301,24 +303,24 @@ JSON
 A video is `{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,…"}}`. Several pictures and videos fit in
 one message and in earlier turns of a conversation.
 
-- **Images**: JPEG (baseline, progressive, grayscale, CMYK), PNG (palette, gray, alpha dropped), BMP, GIF (first frame);
-  up to 100 megapixels. The picture keeps its aspect ratio and is resized (bicubic, antialiased, as the checkpoint's
-  processor does) to 1,024 to 13,312 patches of 16 px, so it costs 256 to 3,328 prompt tokens (a 512 px square costs
-  about 260, 2500×1800 about 3,300, 4.4 s end to end).
-- **Video**: whatever ffmpeg reads (mp4, webm, mov, mkv, …); the container has ffmpeg. Frames are sampled at 2 fps, at
-  most 256 (1 fps and 128 above 720 rows), taken in pairs, and each pair costs about 285 tokens with its
-  "Frame i sampled at t seconds" label. The model card advises clips up to 2 minutes; a 6 s clip is about 1,700
-  tokens and a 2-minute 720p clip about 36,000 (38 s to answer). `BOLT_VIDEO_FPS` and `BOLT_VIDEO_FRAMES` override the
-  sampling. Efficient Video Sampling (token pruning) is not implemented: every frame token is kept.
-- A request carries up to 64 images and videos together (tested with 50 large images and 4 videos, 172,000 tokens, in one
-  chat). Each picture's embeddings are freed once the prompt pass is beyond it. The whole conversation must fit `CONTEXT`.
-  A follow-up turn that repeats the same pictures is answered from the prompt cache (30,000 tokens, 1.7 s).
-- The prompt cache sees the pixels: the same picture again hits the cache, a different one never gets a stale hit.
-- Only data URLs are accepted. An `http(s)` URL or an unreadable picture is a 400 with the reason.
-- The tower runs once per request, before the prompt pass, at the engine's speed (a 512 px image about 0.4 s). Text-only
-  requests are unchanged. `/v1/chat/completions` is served; the Anthropic and Responses endpoints still refuse media.
-- Memory: the tower and projector cost 1.7 GB, plus a scratch that grows with the largest picture seen (about 1 GiB at
-  3,000 px).
+- **Images**: PNG and JPEG (baseline, progressive, grayscale; EXIF orientation honoured, alpha composited over white),
+  up to 10 MB, 8,192 px a side and 16 megapixels. CMYK JPEG, WebP, GIF and BMP are refused by name. The picture keeps its
+  aspect ratio and is resized (antialiased bicubic, as the checkpoint's processor does) to 1,024 to 13,312 patches of
+  16 px, so it costs 256 to 3,328 prompt tokens (a 512 px square about 260; 2560×1920, 3,300).
+- **Video**: MP4 or WebM (H.264, HEVC, VP8, VP9, MPEG-4), up to 16 MB a clip, 20 MB and four clips a request, an hour long.
+  Frames are sampled at 2 a second (1 a second above 720 rows), at most 256 (128 above 720 rows), taken in pairs, each
+  pair about 256 tokens behind its "Frame i sampled at t seconds and frame j sampled at u seconds:" label as the checkpoint's
+  processor writes it. The model card advises clips up to 2 minutes: a 6 s clip is 1,700 tokens, a 2-minute 720p clip
+  36,500 (37 s to answer). Efficient Video Sampling (token pruning) is not implemented: every frame token is kept.
+- A request holds up to 64 images and 4 videos in one chat. Tested: 50 images and 4 videos, 30,500 tokens, 29 s; 50 images of
+  2560×1920 (165,600 tokens), 313 s, every one read correctly. Each prompt piece encodes only the images it crosses, so
+  memory does not grow with the count. The whole conversation must fit `CONTEXT`.
+- The prompt cache sees the pixels: the same picture again hits the cache, a different one never gets a stale hit. A
+  follow-up turn that repeats 50 images and 4 videos (30,500 tokens) answers in 1.7 s.
+- Data URLs, or HTTPS URLs with `VISION_URLS=1`. A picture the server cannot read is a 400 with the reason.
+- The chat route, the Anthropic route (`image` blocks) and the Responses route (`input_image`) take images; text-only
+  requests are unchanged.
+- Memory: the tower and projector are 1.7 GB, plus the tower's scratch and a 134 MB rows buffer.
 
 ### Thinking and sampling
 
@@ -327,21 +329,17 @@ Thinking is on. Per request, `temperature`, `top_p` and `seed` override the defa
 `{"enable_thinking": true, "medium_effort": true}`. Reasoning and the answer share `max_tokens`.
 
 Not served by this backend: logprobs, grammar-constrained decoding, speculative trees, int8/int4 KV caches (`fp8` and
-`bf16` only), remote image URLs, media on the Anthropic and Responses endpoints.
+`bf16` only), WebP, GIF and BMP pictures.
 
 ## What the patches and the engine are
 
-- `patches/0001-refuse-bolt-checkpoint.patch`, in `zig/src/families/nemotron/config.zig`: a `model_type` of
-  `nemotron_h_omni` or `nemotron_h_puzzle` is not claimed by Lightning's parser (it returns `UnsupportedCheckpoint`
-  there), so the Bolt backend gets the checkpoint. The image build runs `zig test` on that file.
-- `patches/0002-register-bolt.patch`: registers `nemotron.bolt` next to `nemotron.native` in the CUDA host, builds the
-  prompt cache over Bolt's own state copies (`snap_*` in `engine/bolt_native.zig`) and keeps Lightning's learner off.
-- `patches/0003-media.patch`: image and video input. A picture type in the lane interface (`core/lanes/media.zig`), the
-  server's `server/media.zig` (collects data-URL pictures from message parts, salts the placeholder ids by pixel hash
-  so the prompt cache cannot confuse two pictures, checks the features) and the plumbing from the request into the
-  stream. `engine/bolt_native.zig` decodes, encodes and feeds the embeddings into the prompt pass.
+- `patches/0001-vision-image-tokens.patch`: `--vision-image-tokens` up to 262,144 (it stopped at 16,384).
+- `patches/0002-register-bolt.patch`: the family `nemotron_h_puzzle` (an omni config around a puzzle text model reads as
+  that type), its registration in the CUDA host, prompt-cache rules without lookahead, and `zig build bolt` for libbolt.
+- `patches/0003-nemotron-video.patch`: video through the RADIO tower (tubelets, the processor's frame labels), the
+  template's `<video>` turned into one token before encoding, `--vision-max-videos`.
 - `engine/bolt_native.zig` (copied into the family at build time) is the lane backend; `engine/*.cu` builds
-  `libbolt.so` (linked with `-lcuda` for the virtual-memory calls). [`docs/engine.md`](docs/engine.md) has the
+  `libbolt.so` (`zig build bolt -Dbolt-src=engine`, linked with `-lcuda` for the virtual-memory calls). [`docs/engine.md`](docs/engine.md) has the
   interface and the memory layout.
 
 ## Checks
@@ -382,8 +380,8 @@ are under the [OpenMDW License Agreement, version 1.1](https://huggingface.co/nv
 governed by the [NVIDIA Software License Agreement](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/)
 and the [Product-Specific Terms for NVIDIA AI Products](https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/),
 which the container prints at every start. By pulling or running the image you accept them. The MIT license above
-covers this repository's scripts only. The image also installs FFmpeg from Ubuntu's package (LGPL/GPL, run as a separate
-process to decode video). `engine/stb_image.h` is public domain and the IQ2_XXS tables are ggml's (MIT); see
+covers this repository's scripts only. The image also holds FFmpeg 9.0.2 (decoders only, built from source, LGPL) inside
+`libtfvideo`, libjpeg-turbo 3.1.4.1 (BSD, IJG, zlib) and the IQ2_XXS tables from ggml (MIT); see
 [`NOTICE`](NOTICE).
 
 ## Credits
@@ -395,6 +393,6 @@ the [TensorFold contributors](https://github.com/ashhart/TensorFold/graphs/contr
 The script layout follows MiaAI-Lab's
 [Qwen3.8 Flash Next TensorFold recipe](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold).
 The IQ2_XXS and Q8_0 formats and tables are [ggml](https://github.com/ggml-org/ggml)'s (MIT), pictures are decoded with
-[stb_image](https://github.com/nothings/stb) (public domain), video with [FFmpeg](https://ffmpeg.org), and the image is
+[libjpeg-turbo](https://libjpeg-turbo.org), video with [FFmpeg](https://ffmpeg.org), and the image is
 built with [Zig](https://ziglang.org) on NVIDIA's PyTorch container.
 The full list is in [`CREDITS.md`](CREDITS.md).

@@ -15,7 +15,7 @@
 #   image    IMAGE, TF_REPO, TF_REF, ZIG_VERSION, BASE_IMAGE, GHCR_IMAGE, CONTAINER_NAME
 #   setup    PREPARE (auto | 1 | 0), PULL, FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
 #   engine   every TENSORFOLD_* variable goes into the container (TENSORFOLD_API_KEY by name only)
-#            KV_DTYPE is bf16 (default) or fp8 (e4m3 with a scale per token and head: half the KV memory). VISION=1 (default) loads the image and video tower.
+#            KV_DTYPE is bf16 (default) or fp8 (e4m3 with a scale per token and head: half the KV memory). VISION=1 (default) loads the image and video tower; VISION_MAX_IMAGES / _MAX_VIDEOS / _IMAGE_TOKENS / _VIDEO_TOKENS size it.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -32,7 +32,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 [[ "$CONTEXT" =~ ^[1-9][0-9]*$ && "$CONTEXT" -le 262144 ]] || die "CONTEXT is a token count up to 262144, not $CONTEXT"
 [[ "$PARALLEL" =~ ^([1-9]|1[0-6])$ ]] || die "PARALLEL is 1 to 16, not $PARALLEL"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
-for v in THINKING DRAFTS VISION SERVE KV_PIN; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+for v in THINKING DRAFTS VISION VISION_URLS SERVE KV_PIN; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$KV_DTYPE" =~ ^(bf16|fp8)$ ]] || die "KV_DTYPE is bf16 or fp8, not $KV_DTYPE (the engine has no int8 or int4 cache)"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
@@ -42,6 +42,11 @@ SERVE_ARGS=(--context "$CONTEXT" --parallel "$PARALLEL" --max-tokens "$MAX_TOKEN
 [[ -n "$TOP_K" ]] && SERVE_ARGS+=(--top-k "$TOP_K")
 if [[ "$THINKING" == 1 ]]; then SERVE_ARGS+=(--thinking); else SERVE_ARGS+=(--no-thinking); fi
 [[ "$DRAFTS" == 1 ]] || SERVE_ARGS+=(--no-drafts)
+if [[ "$VISION" == 1 ]]; then
+  SERVE_ARGS+=(--vision --vision-max-images "$VISION_MAX_IMAGES" --vision-max-videos "$VISION_MAX_VIDEOS"
+               --vision-image-tokens "$VISION_IMAGE_TOKENS" --vision-video-tokens "$VISION_VIDEO_TOKENS")
+  [[ "$VISION_URLS" == 1 ]] && SERVE_ARGS+=(--vision-urls)
+fi
 ENV_DRAFT=(); [[ "$DRAFTS" == 1 ]] && ENV_DRAFT=(-e "BOLT_DRAFT=/root/.cache/huggingface/hub/models--${DRAFT_ID//\//--}/snapshots/$DRAFT_REVISION")
 USER_ARGS=("$@")
 arg_value() {
@@ -55,8 +60,8 @@ arg_value() {
   done
   echo "$value"
 }
-# libbolt keeps one sequence of state per stream: --parallel sets how many
-ENV_SEQS=(-e "BOLT_SEQS=$(arg_value --parallel)" -e "BOLT_KV=$KV_DTYPE" -e "BOLT_KV_PIN=$KV_PIN" -e "BOLT_VISION=$VISION")
+# libbolt keeps one sequence of state per stream (--parallel, which the backend passes on); its cache type and pinning
+ENV_SEQS=(-e "BOLT_KV=$KV_DTYPE" -e "BOLT_KV_PIN=$KV_PIN")
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
 URL="http://$API_HOST:$PORT"

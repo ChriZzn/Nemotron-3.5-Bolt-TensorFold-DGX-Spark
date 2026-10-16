@@ -1,0 +1,682 @@
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 243b3386..7472c9a0 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -70,7 +70,7 @@ pub const Request = struct {
+     shared_prefixes: []const u32 = &.{},
+     /// Where the latest user message's text starts: a state kept before it lets an edit of that turn resume (0: none).
+     rewind_len: u32 = 0,
+-    /// Where the prompt's prefill chunks start after 0 (Python's PrefillPlan at ``Info.prefill_step``); empty: the engine's own.
++    /// Where the prompt's prefill chunks start after 0 (Python's PrefillPlan at ``Info.prefill_step``); empty: its own.
+     chunks: []const u32 = &.{},
+     /// Decoded intervals [start,end), sorted, nonempty and strictly separated; an empty list uses prompt arithmetic.
+     decode_spans: []const [2]u32 = &.{},
+@@ -150,8 +150,8 @@ pub const FrameSink = struct {
+     take: *const fn (ctx: *anyopaque, k: usize, rgb: []const u8, width: u32, height: u32, stride: usize) anyerror!void,
+ };
+ 
+-/// A video prepared for the tower: each group of frames an image, and each group's time in seconds.
+-pub const PreparedVideo = struct { groups: []PreparedImage, times: []f64 };
++/// A video for the tower: each group of frames an image, its time in seconds, and the words before it (``labels``).
++pub const PreparedVideo = struct { groups: []PreparedImage, times: []f64, labels: []const []const u8 = &.{} };
+ 
+ /// Video input an engine serves (``Vision.video``): how a decoded video becomes images and how the prompt holds them.
+ pub const VideoOffer = struct {
+@@ -159,6 +159,8 @@ pub const VideoOffer = struct {
+     prepare: *const fn (ctx: *anyopaque, a: Allocator, src: VideoSource, max_tokens: u32, max_frames: u32) anyerror!PreparedVideo,
+     /// The token the chat template writes once per video, expanded to its groups.
+     video_token: u32,
++    /// The text the template writes for a video, swapped for ``video_token``'s text before encoding (Omni's `<video>`).
++    video_text: []const u8 = "",
+     /// The tokens around each group's image tokens; the group's time follows as text.
+     group_open: u32,
+     group_close: u32,
+diff --git a/zig/src/families/nemotron/cuda_vision.zig b/zig/src/families/nemotron/cuda_vision.zig
+index 096071df..f963b3a4 100644
+--- a/zig/src/families/nemotron/cuda_vision.zig
++++ b/zig/src/families/nemotron/cuda_vision.zig
+@@ -4,6 +4,7 @@ const cuda = @import("cuda");
+ const core = @import("core");
+ const lanes = @import("lanes");
+ const radio = @import("radio");
++pub const video = radio.video;
+ 
+ /// What a request may hold: image tokens in all (the rows buffer), and images.
+ pub const Limits = struct { image_tokens: u32, max_images: u32 };
+@@ -79,6 +80,11 @@ pub const Vision = struct {
+     /// The words for a prepare error the server cannot word (a JPEG library this machine lacks).
+     pub const explain = radio.decoderProblem;
+ 
++    /// A decoded video as the tower reads it: its frames sampled, sized and paired, with the words before each pair.
++    pub fn prepareVideo(v: *const Vision, a: std.mem.Allocator, src: radio.video.Source, max_tokens: u32, max_frames: u32) !radio.video.Prepared {
++        return radio.video.prepare(a, &v.cfg, src, max_tokens, max_frames);
++    }
++
+     /// An image's bytes as the tower reads them, at most `max_tokens` tokens (the server's prepare).
+     pub fn prepare(v: *const Vision, a: std.mem.Allocator, data: []const u8, max_tokens: u32) !radio.image.Prepared {
+         return radio.image.prepare(v.io, a, &v.cfg, data, max_tokens);
+diff --git a/zig/src/families/radio/config.zig b/zig/src/families/radio/config.zig
+index 974468d4..dabddf56 100644
+--- a/zig/src/families/radio/config.zig
++++ b/zig/src/families/radio/config.zig
+@@ -21,6 +21,8 @@ pub const Config = struct {
+     max_patches: u32,
+     max_model_len: u32,
+     image_token: u32, // img_context_token_id
++    video_temporal: usize = 0, // frames packed to a video patch (video_temporal_patch_size); 0: the checkpoint has no video projection
++    video_target_patches: u32 = 1024, // the patches a video frame is sized to (video_target_num_patches)
+ 
+     /// 4 patches (2 x 2) to one token: downsample_ratio 0.5.
+     pub const shuffle = 2;
+@@ -36,6 +38,11 @@ pub const Config = struct {
+         return channels * c.patch * c.patch;
+     }
+ 
++    /// A video patch: `video_temporal` frames' patches side by side.
++    pub fn videoWidth(c: Config) usize {
++        return c.video_temporal * c.patchWidth();
++    }
++
+     /// The config, or null with `problem` (from `a`) naming what the kernels cannot read; NoVisionTower without one.
+     pub fn parse(a: std.mem.Allocator, config_json: []const u8, preprocessor_json: ?[]const u8, problem: *[]const u8) !?Config {
+         var arena: std.heap.ArenaAllocator = .init(a);
+@@ -78,6 +85,8 @@ pub const Config = struct {
+             .max_patches = @intCast(try size(field(pre, v, "max_num_patches"))),
+             .max_model_len = if (pre) |p| @intCast(try size(p.get("max_model_len"))) else 16384,
+             .image_token = @intCast(try size(root.get("img_context_token_id"))),
++            .video_temporal = if (root.get("video_temporal_patch_size")) |x| (if (x == .integer and x.integer > 0) @intCast(x.integer) else 0) else 0,
++            .video_target_patches = if (field(pre, v, "video_target_num_patches")) |x| (if (x == .integer and x.integer > 0) @intCast(x.integer) else 1024) else 1024,
+         };
+         if (c.hidden != try size(root.get("vit_hidden_size"))) return refuse(a, problem, "vit_hidden_size differs from the tower's hidden_size");
+         if (c.dim() * c.heads != c.hidden or (c.dim() != 72 and c.dim() != 80)) return refuse(a, problem, "the tower's head width is not 72 or 80");
+@@ -187,3 +196,25 @@ test "the public checkpoint's image side, and refusals by name" {
+         try std.testing.expect(std.mem.startsWith(u8, why, "the tower's sizes are not positive"));
+     }
+ }
++
++test "the video side: the temporal patch size and the frame budget, none without one" {
++    const a = std.testing.allocator;
++    const text =
++        \\{"downsample_ratio": 0.5, "img_context_token_id": 18, "norm_mean": [0.48145466, 0.4578275, 0.40821073],
++        \\ "norm_std": [0.26862954, 0.26130258, 0.27577711], "projector_hidden_size": 20480, "ps_version": "v2",
++        \\ "vit_hidden_size": 1280, "video_temporal_patch_size": 2, "llm_config": {"hidden_size": 4096},
++        \\ "vision_config": {"model_type": "radio", "hidden_size": 1280, "num_hidden_layers": 32, "num_attention_heads": 16,
++        \\  "mlp_ratio": 4.0, "hidden_act": "gelu", "layer_norm_eps": 1e-06, "layerscale_value": 1.0, "qkv_bias": true,
++        \\  "use_swiglu_ffn": false, "patch_size": 16, "num_channels": 3, "num_cls_tokens": 3, "num_registers": 7,
++        \\  "max_img_size": 2048, "min_num_patches": 1024, "max_num_patches": 13312}}
++    ;
++    var problem: []const u8 = "";
++    const c = (try Config.parse(a, text, "{\"video_target_num_patches\": 1024, \"max_model_len\": 16384}", &problem)).?;
++    try std.testing.expectEqual(@as(usize, 2), c.video_temporal);
++    try std.testing.expectEqual(@as(usize, 1536), c.videoWidth());
++    try std.testing.expectEqual(@as(u32, 1024), c.video_target_patches);
++    const none = try std.mem.replaceOwned(u8, a, text, "\"video_temporal_patch_size\": 2, ", "");
++    defer a.free(none);
++    const d = (try Config.parse(a, none, null, &problem)).?;
++    try std.testing.expectEqual(@as(usize, 0), d.video_temporal);
++}
+diff --git a/zig/src/families/radio/image.zig b/zig/src/families/radio/image.zig
+index 1ed29e04..ed4452f4 100644
+--- a/zig/src/families/radio/image.zig
++++ b/zig/src/families/radio/image.zig
+@@ -39,6 +39,35 @@ pub fn grid(c: *const Config, w: u64, h: u64, room: u64) error{ImageTooSmall}!Gr
+     return .{ .h = @intCast(th), .w = @intCast(tw) };
+ }
+ 
++/// Python's round(): halves to the even neighbour.
++fn pyRound(x: f64) u64 {
++    const f = @floor(x);
++    const d = x - f;
++    const r: f64 = if (d > 0.5 or (d == 0.5 and @mod(f, 2) == 1)) f + 1 else f;
++    return @intFromFloat(r);
++}
++
++/// _compute_target_patches_video: the aspect-preserving grid nearest `video_target_patches`, both sides even.
++pub fn gridVideo(c: *const Config, w: u64, h: u64) Grid {
++    const target: f64 = @floatFromInt(c.video_target_patches);
++    const aspect = @as(f64, @floatFromInt(w)) / @as(f64, @floatFromInt(@max(h, 1)));
++    var ph = @max(pyRound(@sqrt(target / aspect)), 1);
++    var pw = @max(pyRound(@sqrt(target * aspect)), 1);
++    const d = Config.shuffle;
++    const rem_h = ph % d;
++    const rem_w = pw % d;
++    const ph_up = ph + (if (rem_h != 0) d - rem_h else 0);
++    const pw_up = pw + (if (rem_w != 0) d - rem_w else 0);
++    if (@as(f64, @floatFromInt(ph_up * pw_up)) <= target) {
++        ph = ph_up;
++        pw = pw_up;
++    } else {
++        ph = @max(d, ph - rem_h);
++        pw = @max(d, pw - rem_w);
++    }
++    return .{ .h = @intCast(ph), .w = @intCast(pw) };
++}
++
+ /// The patches one image may take when the request allows it `max_tokens` tokens: the processor's bound, or less.
+ pub fn budget(c: *const Config, max_tokens: u32) error{ImageTooSmall}!u64 {
+     const room = @min(@as(u64, c.max_patches), @as(u64, max_tokens) * Config.shuffle * Config.shuffle);
+@@ -139,3 +168,16 @@ test "the hash names the grid: one picture at two budgets is two images to the c
+     try std.testing.expect(whole.hash != small.hash); // another grid: neither resumes a state the other kept
+     try std.testing.expectEqual(whole.hash, again.hash); // the same picture at the same budget resumes
+ }
++
++test "video grids as the processor picks them (its own outputs, 1,024 patches)" {
++    // (width, height) -> (target_w, target_h) from _compute_target_patches_video on the public checkpoint's processor
++    const cases = [_][4]u64{
++        .{ 640, 480, 36, 28 }, .{ 1920, 1080, 42, 24 }, .{ 1280, 720, 42, 24 }, .{ 3840, 2160, 42, 24 },
++        .{ 100, 400, 16, 64 }, .{ 480, 360, 36, 28 },   .{ 1, 1, 32, 32 },      .{ 4000, 16, 506, 2 },
++        .{ 16, 4000, 2, 506 }, .{ 1024, 1024, 32, 32 }, .{ 720, 1280, 24, 42 },
++    };
++    for (cases) |k| {
++        const g = gridVideo(&test_config, k[0], k[1]);
++        try std.testing.expectEqual(Grid{ .h = @intCast(k[3]), .w = @intCast(k[2]) }, g);
++    }
++}
+diff --git a/zig/src/families/radio/radio.zig b/zig/src/families/radio/radio.zig
+index 13e91b71..02135103 100644
+--- a/zig/src/families/radio/radio.zig
++++ b/zig/src/families/radio/radio.zig
+@@ -5,6 +5,7 @@ const core = @import("core");
+ pub const config = @import("config.zig");
+ pub const Config = config.Config;
+ pub const image = @import("image.zig");
++pub const video = @import("video.zig");
+ pub const position = @import("position.zig");
+ pub const weights = @import("weights.zig");
+ pub const Tower = @import("tower.zig").Tower;
+@@ -34,11 +35,16 @@ fn read(a: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, mos
+     };
+ }
+ 
++/// The reserved token a video's `<video>` stands as before encoding: the checkpoint's first spare special token.
++pub const video_token = "<SPECIAL_30>";
++
+ /// The prompt's image tokens: the placeholder the template writes, and the two the processor wraps its rows in.
+ pub const Marks = struct {
+     image: u32,
+     open: u32,
+     close: u32,
++    /// The token a video's placeholder becomes before encoding (the tokenizer has no `<video>` token); null: none.
++    video: ?u32 = null,
+ 
+     /// The marks from the tokenizer's special tokens; null when one is missing or the image token is not the config's.
+     pub fn resolve(t: *const core.tokenizer.Tokenizer, c: *const Config) ?Marks {
+@@ -46,6 +52,7 @@ pub const Marks = struct {
+             .image = t.specialTokenId("<image>") orelse return null,
+             .open = t.specialTokenId("<img>") orelse return null,
+             .close = t.specialTokenId("</img>") orelse return null,
++            .video = t.specialTokenId(video_token),
+         };
+         return if (m.image == c.image_token) m else null;
+     }
+@@ -59,6 +66,7 @@ pub const Marks = struct {
+ test {
+     _ = config;
+     _ = image;
++    _ = video;
+     _ = position;
+     _ = weights;
+     _ = rows;
+diff --git a/zig/src/families/radio/tower.zig b/zig/src/families/radio/tower.zig
+index 286b20fb..92ac9185 100644
+--- a/zig/src/families/radio/tower.zig
++++ b/zig/src/families/radio/tower.zig
+@@ -100,8 +100,11 @@ pub const Tower = struct {
+         const gw: usize = img.gw;
+         const n = gh * gw;
+         const hd = c.hidden;
+-        const pw = c.patchWidth();
++        // a video group's patches hold its frames side by side and go through the video projection
++        const video = c.video_temporal > 0 and img.pixels.len == n * c.videoWidth();
++        const pw = if (video) c.videoWidth() else c.patchWidth();
+         if (n == 0 or n > c.max_patches or gh % 2 != 0 or gw % 2 != 0 or n / 4 != img.tokens or img.pixels.len != n * pw) return error.ImageShape;
++        if (n * pw > c.max_patches * c.patchWidth()) return error.ImageShape; // the scratch holds this many patch values
+         // the float patches land in the f32 products' room (the patch Linear has no bias), cast to bf16 on the GPU
+         try t.scratch.uploadAsync(b.acc - t.scratch.ptr, std.mem.sliceAsBytes(img.pixels), s.handle);
+         try k.cast(s, b.acc, b.px, n * pw);
+@@ -109,7 +112,7 @@ pub const Tower = struct {
+         const rows = n + c.prefix;
+         const feats = b.h + 2 * c.prefix * hd;
+         try t.scratch.copyFrom(b.h - t.scratch.ptr, w.cls, 2 * c.prefix * hd, s.handle);
+-        try g.run(s, b.px, w.patch, b.x, n, hd, pw, .bf16);
++        try g.run(s, b.px, if (video) w.video_patch else w.patch, b.x, n, hd, pw, .bf16);
+         try k.positionAdd(s, b.x, w.table, feats, gh, gw, c.side, hd);
+         const dim = c.dim();
+         const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dim))));
+diff --git a/zig/src/families/radio/video.zig b/zig/src/families/radio/video.zig
+new file mode 100644
+index 00000000..d1a8dd28
+--- /dev/null
++++ b/zig/src/families/radio/video.zig
+@@ -0,0 +1,188 @@
++//! Nemotron Omni's video input: frames sampled at a rate, sized by the video rule and packed in pairs for the tower.
++const std = @import("std");
++const core = @import("core");
++const Config = @import("config.zig").Config;
++const image = @import("image.zig");
++const Allocator = std.mem.Allocator;
++const picture = core.picture;
++
++pub const Error = error{ VideoTooShort, VideoTooLarge, BadVideo, OutOfMemory };
++
++/// The sampling rate, 1 above 720 rows (the model card), and the frames one video may be sampled to at that rate.
++const fps_small: f64 = 2.0;
++const fps_large: f64 = 1.0;
++const frames_large: usize = 128;
++
++/// Where decoded frames go: RGB rows of `width` * 3 bytes, `stride` bytes apart.
++pub const Sink = struct {
++    ctx: *anyopaque,
++    take: *const fn (ctx: *anyopaque, k: usize, rgb: []const u8, width: u32, height: u32, stride: usize) anyerror!void,
++};
++
++/// A decoded video's facts and its frames on request: `decode` gives the frames at `indices` (ascending) to `sink`.
++pub const Source = struct {
++    frames: u64,
++    rate_num: u64,
++    rate_den: u64,
++    width: u32,
++    height: u32,
++    ctx: *anyopaque,
++    decode: *const fn (ctx: *anyopaque, indices: []const u32, sink: Sink) anyerror!void,
++};
++
++/// A video for the tower: one image a pair of frames, each pair's time, and the words the prompt puts before its rows.
++pub const Prepared = struct { groups: []image.Prepared, times: []f64, labels: []const []const u8 };
++
++/// Each sampled frame, resized and cut into patches as it arrives.
++const Collect = struct {
++    a: Allocator,
++    c: *const Config,
++    grid: image.Grid,
++    patches: [][]f32,
++    hashes: []u64,
++    got: usize = 0,
++
++    fn take(ctx: *anyopaque, k: usize, rgb: []const u8, w: u32, h: u32, stride: usize) anyerror!void {
++        const s: *Collect = @ptrCast(@alignCast(ctx));
++        if (k != s.got or k >= s.patches.len or w == 0 or h == 0 or stride < @as(usize, w) * 3) return error.BadVideo;
++        const th = s.grid.h * s.c.patch;
++        const tw = s.grid.w * s.c.patch;
++        const planes = try s.a.alloc(f32, 3 * th * tw);
++        defer s.a.free(planes);
++        try picture.resample.bicubicPlanes(s.a, .{ .pixels = rgb, .width = w, .height = h, .stride = stride }, tw, th, planes);
++        image.normalize(s.c, planes);
++        const out = try s.a.alloc(f32, planes.len);
++        image.cut(s.c, planes, s.grid, out);
++        var id: u64 = 0x7669646f;
++        for (0..h) |y| id = std.hash.Wyhash.hash(id, rgb[y * stride ..][0 .. @as(usize, w) * 3]);
++        s.patches[k] = out;
++        s.hashes[k] = id;
++        s.got += 1;
++    }
++};
++
++/// The frames to decode: a second of video gives `fps` of them, spread over the clip when that is more than `cap`.
++fn sample(a: Allocator, src: Source, fps: f64, cap: usize) Error![]u32 {
++    const rate = @as(f64, @floatFromInt(src.rate_num)) / @as(f64, @floatFromInt(src.rate_den));
++    const length = @as(f64, @floatFromInt(src.frames)) / rate;
++    const whole: usize = @max(1, @as(usize, @intFromFloat(@floor(length * fps))));
++    const want = @min(whole, cap);
++    if (want == 0) return error.VideoTooLarge;
++    const step = if (want == whole) 1.0 / fps else length / @as(f64, @floatFromInt(want));
++    var out: std.ArrayList(u32) = .empty;
++    errdefer out.deinit(a);
++    for (0..want) |k| {
++        var idx: u64 = @intFromFloat(@floor(@as(f64, @floatFromInt(k)) * step * rate + 0.5));
++        if (out.items.len > 0 and idx <= out.items[out.items.len - 1]) idx = out.items[out.items.len - 1] + 1;
++        if (idx >= src.frames) break;
++        try out.append(a, @intCast(idx));
++    }
++    if (out.items.len == 0) return error.VideoTooShort;
++    return out.toOwnedSlice(a);
++}
++
++/// A video within `max_tokens` visual tokens and `max_frames` sampled frames: the frames in pairs, each pair one image.
++pub fn prepare(a: Allocator, c: *const Config, src: Source, max_tokens: u32, max_frames: u32) !Prepared {
++    if (c.video_temporal != 2 or src.width == 0 or src.height == 0) return error.BadVideo;
++    const large = src.height > 720;
++    const grid = image.gridVideo(c, src.width, src.height);
++    const per_group: u32 = grid.h * grid.w / (Config.shuffle * Config.shuffle);
++    if (max_tokens < per_group) return error.VideoTooLarge;
++    const cap = @min(@as(usize, max_frames), if (large) frames_large else std.math.maxInt(usize), @as(usize, max_tokens / per_group) * 2);
++    const indices = try sample(a, src, if (large) fps_large else fps_small, cap);
++    const n = indices.len;
++    const col = try a.create(Collect);
++    col.* = .{ .a = a, .c = c, .grid = grid, .patches = try a.alloc([]f32, n), .hashes = try a.alloc(u64, n) };
++    try src.decode(src.ctx, indices, .{ .ctx = col, .take = Collect.take });
++    if (col.got != n) return error.BadVideo;
++    const groups = (n + 1) / 2;
++    const patch_count: usize = grid.h * grid.w;
++    const pw = c.patchWidth();
++    const out = try a.alloc(image.Prepared, groups);
++    const times = try a.alloc(f64, groups);
++    const labels = try a.alloc([]const u8, groups);
++    const rate = @as(f64, @floatFromInt(src.rate_num)) / @as(f64, @floatFromInt(src.rate_den));
++    const frame_ms = @floor(1000.0 / rate); // the processor times a frame as its index in whole milliseconds a frame
++    for (out, times, labels, 0..) |*g, *t, *label, gi| {
++        const first = gi * 2;
++        const second = if (first + 1 < n) first + 1 else first; // a lone last frame pairs with itself
++        const px = try a.alloc(f32, patch_count * 2 * pw);
++        for (0..patch_count) |p| {
++            @memcpy(px[p * 2 * pw ..][0..pw], col.patches[first][p * pw ..][0..pw]);
++            @memcpy(px[p * 2 * pw + pw ..][0..pw], col.patches[second][p * pw ..][0..pw]);
++        }
++        const ids = [2]u64{ col.hashes[first], col.hashes[second] };
++        const hash = picture.identity.withGrid(picture.identity.ofBytes(0x7ad1e0, std.mem.asBytes(&ids)), .{ grid.h, grid.w });
++        g.* = .{ .pixels = px, .gh = grid.h, .gw = grid.w, .tokens = per_group, .hash = hash };
++        t.* = @as(f64, @floatFromInt(indices[first])) * frame_ms / 1000.0;
++        var words: std.ArrayList(u8) = .empty;
++        if (gi > 0) try words.append(a, '\n');
++        for (first..@min(first + 2, n)) |f| {
++            if (f > first) try words.appendSlice(a, " and ");
++            try words.print(a, "{s} {d} sampled at {d:.2} seconds", .{ if (f == first) "Frame" else "frame", f + 1, @as(f64, @floatFromInt(indices[f])) * frame_ms / 1000.0 });
++        }
++        try words.appendSlice(a, ": ");
++        label.* = words.items;
++    }
++    return .{ .groups = out, .times = times, .labels = labels };
++}
++
++test "a source is sampled at 2 a second, thinned to the cap, and never repeats a frame" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var dummy: u8 = 0;
++    const src: Source = .{ .frames = 150, .rate_num = 30, .rate_den = 1, .width = 640, .height = 480, .ctx = &dummy, .decode = undefined };
++    const all = try sample(a, src, 2.0, 256); // 5 seconds
++    try std.testing.expectEqual(@as(usize, 10), all.len);
++    try std.testing.expectEqual(@as(u32, 0), all[0]);
++    try std.testing.expectEqual(@as(u32, 15), all[1]);
++    const few = try sample(a, src, 2.0, 4);
++    try std.testing.expectEqual(@as(usize, 4), few.len);
++    try std.testing.expect(few[3] > few[2] and few[3] < 150);
++    const slow: Source = .{ .frames = 3, .rate_num = 30, .rate_den = 1, .width = 640, .height = 480, .ctx = &dummy, .decode = undefined };
++    const one = try sample(a, slow, 2.0, 256); // a tenth of a second: its first frame
++    try std.testing.expectEqual(@as(usize, 1), one.len);
++}
++
++/// A source whose frame `i` is one flat colour, grey level 10 * i.
++const Flat = struct {
++    fn decode(_: *anyopaque, indices: []const u32, sink: Sink) anyerror!void {
++        var px: [64 * 48 * 3]u8 = undefined;
++        for (indices, 0..) |idx, k| {
++            @memset(&px, @intCast(10 * idx));
++            try sink.take(sink.ctx, k, &px, 64, 48, 64 * 3);
++        }
++    }
++};
++
++test "frames pair into tubelets: patches side by side, a lone last frame twice, labelled with the processor's words" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const c: Config = .{ .hidden = 1280, .layers = 32, .heads = 16, .ffn = 5120, .eps = 1e-6, .patch = 16, .prefix = 10, .side = 128, .projector_hidden = 20480, .text_hidden = 4096, .final_norm = false, .mean = .{ 0.5, 0.5, 0.5 }, .std = .{ 0.25, 0.25, 0.25 }, .min_patches = 1024, .max_patches = 13312, .max_model_len = 16384, .image_token = 18, .video_temporal = 2 };
++    var dummy: u8 = 0;
++    // 2.6 seconds at 10 a second: 5 samples at 2 a second (frames 0, 5, 10, 15, 20), so two pairs and a lone frame
++    const src: Source = .{ .frames = 26, .rate_num = 10, .rate_den = 1, .width = 64, .height = 48, .ctx = &dummy, .decode = Flat.decode };
++    const p = try prepare(a, &c, src, 4096, 256);
++    try std.testing.expectEqual(@as(usize, 3), p.groups.len);
++    const g = image.gridVideo(&c, 64, 48);
++    try std.testing.expectEqual(g.h * g.w / 4, p.groups[0].tokens);
++    const pw = c.patchWidth();
++    // frame 0 is black (0), frame 5 grey 50: the first patch's first value of each half
++    const first = (0.0 / 255.0 - 0.5) / 0.25;
++    const second = (50.0 / 255.0 - 0.5) / 0.25;
++    try std.testing.expectApproxEqAbs(@as(f32, first), p.groups[0].pixels[0], 1e-3);
++    try std.testing.expectApproxEqAbs(@as(f32, second), p.groups[0].pixels[pw], 1e-3);
++    // the lone frame 20 (grey 200) fills both halves of the last group
++    const last = (200.0 / 255.0 - 0.5) / 0.25;
++    try std.testing.expectApproxEqAbs(@as(f32, last), p.groups[2].pixels[0], 1e-3);
++    try std.testing.expectApproxEqAbs(@as(f32, last), p.groups[2].pixels[pw], 1e-3);
++    try std.testing.expect(p.groups[0].hash != p.groups[1].hash);
++    try std.testing.expectEqualStrings("Frame 1 sampled at 0.00 seconds and frame 2 sampled at 0.50 seconds: ", p.labels[0]);
++    try std.testing.expectEqualStrings("\nFrame 3 sampled at 1.00 seconds and frame 4 sampled at 1.50 seconds: ", p.labels[1]);
++    try std.testing.expectEqualStrings("\nFrame 5 sampled at 2.00 seconds: ", p.labels[2]);
++    try std.testing.expectEqual(@as(f64, 1.0), p.times[1] - p.times[0]); // a pair is a second at 2 frames a second
++    // a token budget under one group's rows refuses the video
++    try std.testing.expectError(error.VideoTooLarge, prepare(a, &c, src, p.groups[0].tokens - 1, 256));
++}
+diff --git a/zig/src/families/radio/weights.zig b/zig/src/families/radio/weights.zig
+index 37b25d00..e6bbe632 100644
+--- a/zig/src/families/radio/weights.zig
++++ b/zig/src/families/radio/weights.zig
+@@ -28,6 +28,7 @@ pub const Layer = struct {
+ pub const Weights = struct {
+     memory: cuda.DeviceBuffer,
+     patch: u64, // [hidden, 3 * patch * patch], no bias
++    video_patch: u64, // [hidden, video_temporal * 3 * patch * patch] (0 without a video projection)
+     table: u64, // the position table [side * side, hidden]
+     cls: u64, // [prefix, hidden]: cls tokens, then registers
+     final: u64, // vision_final_layernorm (unset without an MTP layer: Config.final_norm)
+@@ -106,6 +107,7 @@ const Planner = struct {
+         const h = c.hidden;
+         var buf: [160]u8 = undefined;
+         w.patch = try p.take(tower ++ "patch_generator.embedder.weight", &.{ h, c.patchWidth() }, false);
++        w.video_patch = if (c.video_temporal > 0) try p.take(tower ++ "patch_generator.video_embedder.weight", &.{ h, c.videoWidth() }, false) else 0;
+         w.table = try p.take(tower ++ "patch_generator.pos_embed", &.{ 1, c.side * c.side, h }, false);
+         w.cls = try p.take(tower ++ "patch_generator.cls_token.token", &.{ c.prefix, h }, false);
+         for (w.layers, 0..) |*l, i| {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index b697b9ee..67192636 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -464,7 +464,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         .logprobs = loaded.backend.vtable.first_row != null,
+         .prompt_logprobs = loaded.backend.vtable.prompt_rows,
+         .structures = loaded.backend.vtable.first_masked != null,
+-        .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision) else null,
++        .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
+     }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+diff --git a/zig/src/native/cuda_vision_offer.zig b/zig/src/native/cuda_vision_offer.zig
+index 56b8ac6d..67d1381c 100644
+--- a/zig/src/native/cuda_vision_offer.zig
++++ b/zig/src/native/cuda_vision_offer.zig
+@@ -3,16 +3,60 @@ const std = @import("std");
+ const api = @import("engine_api");
+ const nemotron = @import("nemotron");
+ const Allocator = std.mem.Allocator;
++const Vision = nemotron.native.vision.Vision;
++const video = nemotron.native.vision.video;
+ 
+-/// Info.vision for a Nemotron Omni engine's tower; null without --vision.
+-pub fn offer(v: ?*nemotron.native.vision.Vision) ?api.Vision {
++/// Info.vision for a Nemotron Omni engine's tower; null without --vision. `open` gives a video offer its limits.
++pub fn offer(v: ?*Vision, open: ?api.VisionOpen) ?api.Vision {
+     const x = v orelse return null;
+     const prepare = struct {
+         fn f(ctx: *anyopaque, a: Allocator, bytes: []const u8, max_tokens: u32) anyerror!api.PreparedImage {
+-            const t: *nemotron.native.vision.Vision = @ptrCast(@alignCast(ctx));
++            const t: *Vision = @ptrCast(@alignCast(ctx));
+             const p = try t.prepare(a, bytes, max_tokens);
+             return .{ .pixels = p.pixels, .gh = p.gh, .gw = p.gw, .tokens = p.tokens, .hash = p.hash };
+         }
+     }.f;
+-    return .{ .ctx = x, .prepare = prepare, .image_token = x.marks.image, .markers = &x.mark_ids, .wrap = .{ x.marks.open, x.marks.close }, .image_tokens = x.limits.image_tokens, .max_images = x.limits.max_images, .explain = nemotron.native.vision.Vision.explain };
++    var out: api.Vision = .{ .ctx = x, .prepare = prepare, .image_token = x.marks.image, .markers = &x.mark_ids, .wrap = .{ x.marks.open, x.marks.close }, .image_tokens = x.limits.image_tokens, .max_images = x.limits.max_images, .explain = Vision.explain };
++    // video: the checkpoint's temporal projection, and a reserved token for the template's `<video>`
++    if (x.cfg.video_temporal == 2 and x.marks.video != null) if (open) |o| {
++        out.video = .{
++            .prepare = prepareVideo,
++            .video_token = x.marks.video.?,
++            .video_text = "<video>",
++            .group_open = x.marks.open,
++            .group_close = x.marks.close,
++            .markers = &x.mark_ids,
++            .video_tokens = o.video_tokens,
++            .max_videos = o.max_videos,
++            .max_frames = o.max_frames,
++        };
++    };
++    return out;
++}
++
++/// The server's decoder behind the tower's video source.
++const Decoding = struct {
++    src: api.VideoSource,
++
++    fn decode(ctx: *anyopaque, indices: []const u32, sink: video.Sink) anyerror!void {
++        const d: *Decoding = @ptrCast(@alignCast(ctx));
++        return d.src.decode(d.src.ctx, indices, .{ .ctx = sink.ctx, .take = sink.take });
++    }
++};
++
++fn prepareVideo(ctx: *anyopaque, a: Allocator, src: api.VideoSource, max_tokens: u32, max_frames: u32) anyerror!api.PreparedVideo {
++    const t: *Vision = @ptrCast(@alignCast(ctx));
++    var d: Decoding = .{ .src = src };
++    const p = try t.prepareVideo(a, .{
++        .frames = src.frames,
++        .rate_num = src.rate_num,
++        .rate_den = src.rate_den,
++        .width = src.width,
++        .height = src.height,
++        .ctx = &d,
++        .decode = Decoding.decode,
++    }, max_tokens, max_frames);
++    const groups = try a.alloc(api.PreparedImage, p.groups.len);
++    for (groups, p.groups) |*o, g| o.* = .{ .pixels = g.pixels, .gh = g.gh, .gw = g.gw, .tokens = g.tokens, .hash = g.hash };
++    return .{ .groups = groups, .times = p.times, .labels = p.labels };
+ }
+diff --git a/zig/src/server/cli.zig b/zig/src/server/cli.zig
+index a8317c98..e094bdae 100644
+--- a/zig/src/server/cli.zig
++++ b/zig/src/server/cli.zig
+@@ -53,6 +53,7 @@ pub const flags = [_]Flag{
+     .{ .name = "--vision-urls", .kind = .store_true, .native = true },
+     .{ .name = "--vision-offload", .kind = .store_true },
+     .{ .name = "--vision-max-images", .native = true },
++    .{ .name = "--vision-max-videos", .native = true },
+     .{ .name = "--vision-image-tokens", .native = true },
+     .{ .name = "--vision-video-tokens", .native = true },
+     .{ .name = "--context", .native = true },
+@@ -190,6 +191,7 @@ pub const Args = struct {
+     vision: bool = false, // image input (GLM-5.3-Flash): data-URL image_url parts in user messages
+     vision_urls: bool = false, // with --vision, public HTTPS image URLs too (media_fetch.zig)
+     vision_max_images: u32 = 4,
++    vision_max_videos: u32 = 2,
+     vision_image_tokens: u32 = 4096,
+     vision_image_tokens_set: bool = false, // --vision-image-tokens given: a family's own default no longer applies
+     vision_video_tokens: u32 = 16384, // the visual tokens a request's videos share (the processor's max_image_tokens)
+@@ -309,6 +311,10 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
+         const n = try int(u, a, name, v);
+         if (n < 1 or n > 64) return fail(u, a, "argument --vision-max-images: expected 1 to 64 images: '{s}'", .{v});
+         out.vision_max_images = @intCast(n);
++    } else if (is(name, "--vision-max-videos")) {
++        const n = try int(u, a, name, v);
++        if (n < 1 or n > 16) return fail(u, a, "argument --vision-max-videos: expected 1 to 16 videos: '{s}'", .{v});
++        out.vision_max_videos = @intCast(n);
+     } else if (is(name, "--vision-video-tokens")) {
+         const n = try int(u, a, name, v);
+         if (n < 64 or n > 262144) return fail(u, a, "argument --vision-video-tokens: expected 64 to 262144 tokens: '{s}'", .{v});
+@@ -432,7 +438,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
+         .master = args.master,
+         .master_port = args.master_port,
+         .policy = args.policy,
+-        .vision = if (args.vision) .{ .image_tokens = args.vision_image_tokens, .image_tokens_set = args.vision_image_tokens_set, .max_images = args.vision_max_images, .video_tokens = args.vision_video_tokens } else null,
++        .vision = if (args.vision) .{ .image_tokens = args.vision_image_tokens, .image_tokens_set = args.vision_image_tokens_set, .max_images = args.vision_max_images, .max_videos = args.vision_max_videos, .video_tokens = args.vision_video_tokens } else null,
+     };
+ }
+ 
+diff --git a/zig/src/server/images.zig b/zig/src/server/images.zig
+index 141424fd..3878e629 100644
+--- a/zig/src/server/images.zig
++++ b/zig/src/server/images.zig
+@@ -153,6 +153,7 @@ pub fn markerText(text: model_text.Text, a: std.mem.Allocator, v: api.Vision) ![
+         const s = try text.tokenString(a, id);
+         if (s.len > 0) try out.append(a, s);
+     }
++    if (v.video) |o| if (o.video_text.len > 0) try out.append(a, o.video_text); // user text that spells it stays text
+     std.mem.sort([]const u8, out.items, {}, struct {
+         fn longer(_: void, x: []const u8, y: []const u8) bool {
+             return x.len > y.len;
+@@ -238,7 +239,7 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
+     if (video_marks != n_videos) return cx.fail(.server, "the chat template wrote {d} video placeholders for {d} video parts", .{ video_marks, n_videos });
+     if (ps.len == 0) return null;
+     if (n_images > v.max_images) return cx.refuse(try std.fmt.allocPrint(cx.a, "a request may hold at most {d} images (--vision-max-images); it has {d}", .{ v.max_images, n_images }));
+-    if (n_videos > videos.max_videos) return cx.refuse(try std.fmt.allocPrint(cx.a, "a request supports at most {d} videos", .{videos.max_videos}));
++    if (v.video) |o| if (n_videos > o.max_videos) return cx.refuse(try std.fmt.allocPrint(cx.a, "a request supports at most {d} videos", .{o.max_videos}));
+     const budget: u32 = if (n_images > 0) v.image_tokens / @as(u32, @intCast(n_images)) else 0;
+     if (n_images > 0 and budget < 1) return cx.refuse("the image count exceeds the visual-token budget");
+     const prepared = try cx.a.alloc(api.PreparedImage, n_images);
+@@ -293,12 +294,18 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
+             const o = v.video.?;
+             const clip = clips[kv];
+             kv += 1;
+-            for (clip.groups, clip.times) |g, secs| {
++            for (clip.groups, clip.times, 0..) |g, secs, gi| {
++                if (clip.labels.len > gi) { // the family's own words before the group, its time among them
++                    const words = text.encodePlain(cx.a, clip.labels[gi]) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else cx.fail(.server, "the tokenizer could not encode a video group's label", .{});
++                    try out_ids.appendSlice(cx.a, words);
++                    try key.appendSlice(cx.a, words);
++                }
+                 try out_ids.append(cx.a, o.group_open);
+                 try key.append(cx.a, o.group_open);
+                 try placeImage(cx.a, &out_ids, &key, &imgs, v.image_token, g, true);
+                 try out_ids.append(cx.a, o.group_close);
+                 try key.append(cx.a, image_key.close(g.hash));
++                if (clip.labels.len > 0) continue;
+                 var buf: [64]u8 = undefined;
+                 const words = videos.seconds(&buf, secs) catch unreachable; // a time within the hour's limit
+                 const time = text.encodePlain(cx.a, words) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else cx.fail(.server, "the tokenizer could not encode a video group's time", .{});
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 48e058b0..e986dd71 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -59,7 +59,11 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
+ fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error![]u32 {
+     const v = srv.info.vision orelse return srv.text.renderIds(a, messages, options, problem);
+     const markers = try images.markerText(srv.text, a, v);
+-    const text = try srv.text.render(a, try images.shield(a, messages, markers), options, problem);
++    var text = try srv.text.render(a, try images.shield(a, messages, markers), options, problem);
++    if (v.video) |o| if (o.video_text.len > 0) { // the template's own video placeholder becomes one token before encoding
++        const word = try srv.text.tokenString(a, o.video_token);
++        text = try std.mem.replaceOwned(u8, a, text, o.video_text, word);
++    };
+     return images.encodeShielded(srv.text, a, text, markers);
+ }
+ 
+diff --git a/zig/src/server/videos.zig b/zig/src/server/videos.zig
+index 9679475a..8a73c74e 100644
+--- a/zig/src/server/videos.zig
++++ b/zig/src/server/videos.zig
+@@ -2,6 +2,7 @@
+ const std = @import("std");
+ const api = @import("engine_api");
+ const errors = @import("errors.zig");
++const json = @import("json");
+ const images = @import("images.zig");
+ const media_fetch = @import("media_fetch.zig");
+ const Cx = errors.Cx;
+@@ -214,3 +215,30 @@ test "group times as Python's f\"{t:.1f} seconds\"" {
+         );
+     }
+ }
++
++fn noPrepare(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) anyerror!api.PreparedImage {
++    return error.Unused;
++}
++
++fn noVideo(_: *anyopaque, _: std.mem.Allocator, _: api.VideoSource, _: u32, _: u32) anyerror!api.PreparedVideo {
++    return error.Unused;
++}
++
++test "a request's videos are limited by the engine's offer, not by a constant" {
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var cx: Cx = .{ .a = a };
++    var dummy: u8 = 0;
++    const offer: api.VideoOffer = .{ .prepare = noVideo, .video_token = 8, .group_open = 6, .group_close = 7, .video_tokens = 64, .max_videos = 1, .max_frames = 256 };
++    const v: api.Vision = .{ .ctx = &dummy, .prepare = noPrepare, .image_token = 9, .image_tokens = 64, .max_images = 4, .video = offer };
++    const two = switch (try json.parseText(a,
++        \\[{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,YQ=="}},
++        \\  {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,YQ=="}}]}]
++    )) {
++        .ok => |m| m,
++        .err => return error.TestUnexpectedResult,
++    };
++    try std.testing.expectError(error.Refused, images.expand(v, null, images.MarkText.text(), &cx, two, &[_]u32{ 8, 8 }, 0));
++    try std.testing.expectEqualStrings("a request supports at most 1 videos", cx.message);
++}

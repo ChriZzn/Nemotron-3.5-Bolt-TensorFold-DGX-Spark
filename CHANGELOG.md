@@ -1,7 +1,7 @@
 # Changelog
 
-Newest first. This recipe targets one DGX Spark. The image is `tensorfold-nemotron-bolt:zig-c7137bb`, built by
-`scripts/prepare.sh` from TensorFold `c7137bb3` plus `patches/`.
+Newest first. This recipe targets one DGX Spark. The image is `tensorfold-nemotron-bolt:zig-46a08c1`, built by
+`scripts/prepare.sh` from TensorFold `46a08c18` (1.0.12) plus `patches/`.
 
 ## Unreleased
 
@@ -9,18 +9,21 @@ The Bolt backend serves the checkpoint. Measured on one GB10: decode 4.3 tok/s t
 LiLiCorr, greedy chat or code), 55 to 60 sampled; prefill 4.5 tok/s to 1,300 to 1,470 (from 1k to 50k tokens);
 sixteen streams at once, 167 tok/s aggregate sampled and 172 greedy.
 
-### Images and video
+### TensorFold 1.0.12, images and video
 
-- **C-RADIO v4-H in libbolt** (`engine/bolt_vision.cu`): GPU resize (antialiased bicubic, as the checkpoint's
-  processor), 32-layer ViT on the tensor-core GEMMs with a bidirectional flash-attention kernel for head dim 80,
-  cropped position embedding with 10 prefix tokens, 2×2 pixel shuffle, RMSNorm and the ReLU² MLP projector. Against the
-  PyTorch reference the final embeddings have relative L2 error 4.5e-3 (cos 0.99999). Video runs the same tower on
-  two-frame tubelets; ffmpeg decodes and resizes. JPEG/PNG/BMP/GIF decode with the public-domain `stb_image.h`.
-- **`patches/0003-media.patch`** and the backend: `image_url` and `video_url` parts as base64 data URLs on
-  `/v1/chat/completions`, prompt-cache keys salted by pixel hash, embeddings spliced in during the prompt pass in
-  pieces. `VISION=1` is now the default (`VISION=0` for text only); the image installs ffmpeg.
-- Up to 64 pictures a request (50 images and 4 videos tested in one chat); embeddings are freed as the prompt pass moves past them.
-- Text-only speed and outputs are unchanged; the tower loads only when `BOLT_VISION=1`.
+- **Rebased onto TensorFold 1.0.12.** Upstream now ships a RADIO tower and image input, so the recipe uses them: the
+  tower, the image and video server code and the Anthropic and Responses media routes are upstream's, the engine's own
+  ViT, stb_image decoder and ffmpeg subprocess are gone. Bolt is the family `nemotron_h_puzzle`, built with
+  `zig build bolt`; libbolt takes image rows by device pointer (`bolt_prefill_seq_rows`) and checks an ABI version.
+- **Video** through the same tower: tubelets of two frames through `video_embedder`, the processor's frame labels,
+  `<video>` turned into one token before encoding, `--vision-max-videos` (patch 0003). Decoding is upstream's libtfvideo
+  over FFmpeg 9.0.2, built in the image.
+- **A request holds up to 64 images and 4 videos** (`VISION_MAX_IMAGES`, `VISION_MAX_VIDEOS`); each prompt piece encodes
+  only the images it crosses. Tested: 50 images and 4 videos in one chat, and 50 images of 2560×1920 (165,600 tokens).
+- Formats follow upstream's: PNG and JPEG (libjpeg-turbo 3.1.4.1, in the image), HTTPS URLs behind `VISION_URLS=1`;
+  GIF, BMP and CMYK JPEG are no longer read. Text speed and outputs are unchanged (perplexity 5.286; greedy replies
+  identical to the previous base).
+- `--parallel` reaches libbolt through the backend (no `BOLT_SEQS` in `start.sh`).
 
 ### Sixteen streams, a faster prompt pass
 

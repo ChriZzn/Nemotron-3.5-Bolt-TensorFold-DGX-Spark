@@ -24,10 +24,10 @@ QUANT_LABEL="IQ2_XXS+NVFP4+Q8_0"
 DRAFT_ID="${DRAFT_ID:-nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr}"
 DRAFT_REVISION="${DRAFT_REVISION:-4c6a5613b6d887194a3a5493e3a18a5b3930bb86}"
 
-# TensorFold main, the Nemotron 3.5 Lightning recipe (docs/recipes/nemotron-3.5.md). patches/0001 names a Bolt
-# checkpoint and refuses it before Lightning's shape check. Zig ZIG_VERSION builds the native CUDA server.
+# TensorFold main at 1.0.12 (Nemotron 3.5 Super VL on CUDA, its RADIO tower). patches/ add the Bolt family, video input and
+# a larger image-token cap. Zig ZIG_VERSION builds the native CUDA server.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-c7137bb31a7dad924fb541a7068422127b9a94b2}"
+TF_REF="${TF_REF:-46a08c18608153bfc566703a88acc883bc6140f4}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -76,9 +76,16 @@ THINKING="${THINKING:-1}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-0.95}"
 TOP_K="${TOP_K:-}"
-# Images and video: libbolt runs the checkpoint's C-RADIO tower (1.7 GB of weights, loaded when VISION=1). Pictures arrive as
-# base64 data URLs; the container has ffmpeg for video. VISION=0 serves text only and skips the weights.
+# Images and video: TensorFold's RADIO tower (1.7 GB of weights, loaded when VISION=1). Pictures arrive as base64 data URLs
+# (VISION_URLS=1 also fetches public HTTPS URLs). A request holds up to VISION_MAX_IMAGES images and VISION_MAX_VIDEOS videos;
+# the token budgets are shared by a request's images (VISION_IMAGE_TOKENS) and its videos (VISION_VIDEO_TOKENS).
+# VISION=0 serves text only and skips the weights.
 VISION="${VISION:-1}"
+VISION_URLS="${VISION_URLS:-0}"
+VISION_MAX_IMAGES="${VISION_MAX_IMAGES:-64}"
+VISION_MAX_VIDEOS="${VISION_MAX_VIDEOS:-4}"
+VISION_IMAGE_TOKENS="${VISION_IMAGE_TOKENS:-262144}"
+VISION_VIDEO_TOKENS="${VISION_VIDEO_TOKENS:-131072}"
 export TENSORFOLD_MEMORY_RESERVE_GIB="${TENSORFOLD_MEMORY_RESERVE_GIB:-10}"
 export TENSORFOLD_NO_UPDATE_CHECK="${TENSORFOLD_NO_UPDATE_CHECK:-1}"
 # SERVE=0 stops after the checkpoint check.

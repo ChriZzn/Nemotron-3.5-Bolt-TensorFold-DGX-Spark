@@ -126,31 +126,35 @@ ARG TF_REF
 RUN git init -q /tensorfold && cd /tensorfold && git remote add origin "${TF_REPO}" && \
     git fetch -q --depth 1 origin "${TF_REF}" && git checkout -q --detach FETCH_HEAD && \
     test "$(git rev-parse HEAD)" = "${TF_REF}"
+# the decoders libtfvideo needs (FFmpeg 9.0.2, upstream's script) and the JPEG library the pictures need (libjpeg-turbo 3.1.4.1)
+RUN cd /tensorfold && tools/zig/build_ffmpeg.sh /opt/ffmpeg >/tmp/ffmpeg.log 2>&1 && \
+    curl -fsSL -o /tmp/jt.tgz https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/3.1.4.1/libjpeg-turbo-3.1.4.1.tar.gz && \
+    echo "ecae8008e2cc9ade2f2c1bb9d5e6d4fb73e7c433866a056bd82980741571a022  /tmp/jt.tgz" | sha256sum -c - && \
+    tar -xzf /tmp/jt.tgz -C /tmp && cd /tmp/libjpeg-turbo-3.1.4.1 && \
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_STATIC=0 -DWITH_TURBOJPEG=1 -DCMAKE_INSTALL_PREFIX=/opt/jpeg >/dev/null && \
+    cmake --build build -j"$(nproc)" >/dev/null && cmake --install build >/dev/null && rm -rf /tmp/jt.tgz /tmp/libjpeg-turbo-3.1.4.1
 COPY patches /opt/tf-patches
 COPY engine /opt/bolt-engine
 RUN cd /tensorfold && \
     for p in /opt/tf-patches/*.patch; do [ -e "$p" ] || continue; echo "applying $p"; git apply --check "$p" && git apply "$p" || exit 1; done && \
-    cp /opt/bolt-engine/bolt_native.zig zig/src/families/nemotron/bolt_native.zig && \
-    /opt/zig/zig test zig/src/families/nemotron/config.zig
-RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Doptimize=fast --prefix /opt/tensorfold \
-      -j"$(nproc)" install native && \
+    cp /opt/bolt-engine/bolt_native.zig zig/src/families/nemotron/bolt_native.zig
+RUN cd /tensorfold && /opt/zig/zig build -Dnvcc=/usr/local/cuda/bin/nvcc -Dbolt-src=/opt/bolt-engine -Dffmpeg=/opt/ffmpeg \
+      -Doptimize=fast --prefix /opt/tensorfold -j"$(nproc)" install native bolt video && \
+    cp -a /opt/jpeg/lib/libturbojpeg.so.0* /opt/tensorfold/native/lib/ && \
     test -x /opt/tensorfold/native/bin/tensorfold-native && \
-    mkdir -p /opt/tensorfold/lib && \
-    nvcc -shared -Xcompiler -fPIC -O3 -arch=sm_121 -I /opt/bolt-engine -o /opt/tensorfold/lib/libbolt.so \
-      /opt/bolt-engine/bolt_kernels.cu /opt/bolt-engine/bolt_mma.cu /opt/bolt-engine/bolt_host.cu /opt/bolt-engine/bolt_draft.cu /opt/bolt-engine/bolt_vision.cu -lcuda && \
-    test -f /opt/tensorfold/lib/libbolt.so
+    test -f /opt/tensorfold/native/lib/libbolt.so && test -f /opt/tensorfold/native/lib/libtfvideo.so && \
+    test -f /opt/tensorfold/native/lib/libturbojpeg.so.0
 RUN mkdir -p /opt/tensorfold/share/doc/tensorfold && cd /tensorfold && \
     for f in LICENSE LICENSE.md LICENSES NOTICE THIRD_PARTY_NOTICES.md; do \
       if [ -e "$f" ]; then cp -a "$f" /opt/tensorfold/share/doc/tensorfold/ || exit 1; fi; done
 
 FROM ${BASE_IMAGE}
 COPY --from=build /opt/tensorfold /opt/tensorfold
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 RUN ln -s /opt/tensorfold/native/bin/tensorfold-native /usr/local/bin/tensorfold-native && \
     pip install --no-cache-dir "huggingface_hub>=1.0"
 ARG PATCHES_HASH
 LABEL tf.patches=${PATCHES_HASH} tf.gate=bolt
-ENV HF_HOME=/root/.cache/huggingface CUDA_CACHE_PATH=/cache/nv
+ENV HF_HOME=/root/.cache/huggingface CUDA_CACHE_PATH=/cache/nv LD_LIBRARY_PATH=/opt/tensorfold/native/lib
 WORKDIR /workspace
 DOCKERFILE
   rm -rf -- "$ctx"; trap - EXIT

@@ -31,14 +31,14 @@ ggml (and llama.cpp)
   MIT License. Copyright (c) The ggml authors. engine/iq2_tables.inc holds ggml's IQ2_XXS lookup tables, and the
   IQ2_XXS and Q8_0 block layouts the checkpoint is packed in are ggml's.
 
-stb_image.h
-  https://github.com/nothings/stb
-  Public domain (or MIT, at your option), vendored as engine/stb_image.h.
+libjpeg-turbo 3.1.4.1
+  https://libjpeg-turbo.org
+  BSD-3-Clause, IJG and zlib licenses (its LICENSE.md). Built in the image as libturbojpeg.so for TensorFold's JPEG decoder.
 
-FFmpeg
+FFmpeg 9.0.2
   https://ffmpeg.org
-  Installed in the image from Ubuntu's ffmpeg package (LGPL/GPL, see its copyright files in /usr/share/doc/ffmpeg*).
-  libbolt runs it as a separate process; nothing is linked.
+  LGPL 2.1 or later. Built in the image from the release tarball with only the H.264, HEVC, VP8, VP9 and MPEG-4 decoders and
+  the MP4 and Matroska demuxers, statically linked into libtfvideo.so (TensorFold's tools/zig/build_ffmpeg.sh).
 
 Zig
   https://ziglang.org
