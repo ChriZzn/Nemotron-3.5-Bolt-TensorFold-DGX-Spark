@@ -506,12 +506,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     var tower: ?*vision.Vision = null;
     var problem: []const u8 = "";
     if (o.vision) |lim| {
-        // the rows buffer holds one prompt piece's images; the request's token total is the server's limit alone
+        // the rows buffer holds one prompt piece's images; a request's token totals are the server's limit alone
         tower = (try vision.Vision.init(gpa, io, ctx.d, dir, .{ .image_tokens = @min(lim.image_tokens, image_rows), .max_images = lim.max_images }, &problem)) orelse {
             std.log.err("--vision: {s}", .{problem});
             return error.VisionRefused;
         };
         tower.?.limits.image_tokens = lim.image_tokens;
+        tower.?.limits.video_tokens = lim.video_tokens;
     }
     errdefer if (tower) |v| v.deinit();
     var stream: ?cuda.Stream = if (tower != null) try cuda.Stream.init(ctx.d, false) else null;

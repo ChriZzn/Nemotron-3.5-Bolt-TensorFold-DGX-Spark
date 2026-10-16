@@ -110,18 +110,33 @@ index 00000000..1a65e0e6
 +    max_frames: u32,
 +};
 diff --git a/zig/src/families/nemotron/cuda_vision.zig b/zig/src/families/nemotron/cuda_vision.zig
-index 096071df..f963b3a4 100644
+index 096071df..8ad82f28 100644
 --- a/zig/src/families/nemotron/cuda_vision.zig
 +++ b/zig/src/families/nemotron/cuda_vision.zig
-@@ -4,6 +4,7 @@ const cuda = @import("cuda");
+@@ -4,9 +4,10 @@ const cuda = @import("cuda");
  const core = @import("core");
  const lanes = @import("lanes");
  const radio = @import("radio");
 +pub const video = radio.video;
  
  /// What a request may hold: image tokens in all (the rows buffer), and images.
- pub const Limits = struct { image_tokens: u32, max_images: u32 };
-@@ -79,6 +80,11 @@ pub const Vision = struct {
+-pub const Limits = struct { image_tokens: u32, max_images: u32 };
++pub const Limits = struct { image_tokens: u32, max_images: u32, video_tokens: u32 = 0 };
+ 
+ pub const Vision = struct {
+     gpa: std.mem.Allocator,
+@@ -36,7 +37,9 @@ pub const Vision = struct {
+         };
+         var tower = try radio.Tower.init(gpa, io, d, dir, cfg);
+         errdefer tower.deinit();
+-        var rows = try radio.Rows.init(d, limits.image_tokens, cfg.text_hidden);
++        // a request's images and videos are budgeted apart but planned together: the rows hold both budgets
++        const capacity = limits.image_tokens +| (if (cfg.video_temporal > 0) limits.video_tokens else 0);
++        var rows = try radio.Rows.init(d, capacity, cfg.text_hidden);
+         errdefer rows.deinit();
+         const v = try gpa.create(Vision);
+         v.* = .{ .gpa = gpa, .io = io, .cfg = cfg, .tower = tower, .rows = rows, .marks = marks, .limits = limits, .mark_ids = marks.markers() };
+@@ -79,6 +82,11 @@ pub const Vision = struct {
      /// The words for a prepare error the server cannot word (a JPEG library this machine lacks).
      pub const explain = radio.decoderProblem;
  
@@ -323,10 +338,10 @@ index 286b20fb..92ac9185 100644
          const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(dim))));
 diff --git a/zig/src/families/radio/video.zig b/zig/src/families/radio/video.zig
 new file mode 100644
-index 00000000..d1a8dd28
+index 00000000..f79f1360
 --- /dev/null
 +++ b/zig/src/families/radio/video.zig
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,205 @@
 +//! Nemotron Omni's video input: frames sampled at a rate, sized by the video rule and packed in pairs for the tower.
 +const std = @import("std");
 +const core = @import("core");
@@ -479,7 +494,7 @@ index 00000000..d1a8dd28
 +    fn decode(_: *anyopaque, indices: []const u32, sink: Sink) anyerror!void {
 +        var px: [64 * 48 * 3]u8 = undefined;
 +        for (indices, 0..) |idx, k| {
-+            @memset(&px, @intCast(10 * idx));
++            @memset(&px, @truncate(10 *% idx));
 +            try sink.take(sink.ctx, k, &px, 64, 48, 64 * 3);
 +        }
 +    }
@@ -515,6 +530,23 @@ index 00000000..d1a8dd28
 +    // a token budget under one group's rows refuses the video
 +    try std.testing.expectError(error.VideoTooLarge, prepare(a, &c, src, p.groups[0].tokens - 1, 256));
 +}
++
++test "a video never holds more visual tokens than it was given, so images plus videos fit their two budgets" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const c: Config = .{ .hidden = 1280, .layers = 32, .heads = 16, .ffn = 5120, .eps = 1e-6, .patch = 16, .prefix = 10, .side = 128, .projector_hidden = 20480, .text_hidden = 4096, .final_norm = false, .mean = .{ 0.5, 0.5, 0.5 }, .std = .{ 0.25, 0.25, 0.25 }, .min_patches = 1024, .max_patches = 13312, .max_model_len = 16384, .image_token = 18, .video_temporal = 2 };
++    var dummy: u8 = 0;
++    // 64 seconds at 2 samples a second: 64 groups of 252 rows, more than the smaller budgets hold
++    const src: Source = .{ .frames = 64 * 30, .rate_num = 30, .rate_den = 1, .width = 64, .height = 48, .ctx = &dummy, .decode = Flat.decode };
++    for ([_]u32{ 16384, 5000, 600 }) |budget| {
++        const p = try prepare(a, &c, src, budget, 256);
++        var rows: u32 = 0;
++        for (p.groups) |g| rows += g.tokens;
++        try std.testing.expect(rows <= budget);
++        if (budget < 16000) try std.testing.expect(rows + 252 > budget); // the smaller budgets fill to within one group
++    }
++}
 diff --git a/zig/src/families/radio/weights.zig b/zig/src/families/radio/weights.zig
 index 37b25d00..e6bbe632 100644
 --- a/zig/src/families/radio/weights.zig
@@ -536,9 +568,18 @@ index 37b25d00..e6bbe632 100644
          w.cls = try p.take(tower ++ "patch_generator.cls_token.token", &.{ c.prefix, h }, false);
          for (w.layers, 0..) |*l, i| {
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index b697b9ee..67192636 100644
+index b697b9ee..d23c995e 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
+@@ -325,7 +325,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+             return null;
+         }
+         const own: ?u32 = comptime if (@hasDecl(F, "default_image_tokens")) F.default_image_tokens else null;
+-        opts.vision = .{ .image_tokens = if (vo.image_tokens_set) vo.image_tokens else own orelse vo.image_tokens, .max_images = vo.max_images };
++        opts.vision = .{ .image_tokens = if (vo.image_tokens_set) vo.image_tokens else own orelse vo.image_tokens, .max_images = vo.max_images, .video_tokens = vo.video_tokens };
+     }
+     if (o.precision) |p| {
+         if (!@hasField(F.Options, "precision")) {
 @@ -464,7 +464,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
          .logprobs = loaded.backend.vtable.first_row != null,
          .prompt_logprobs = loaded.backend.vtable.prompt_rows,
@@ -549,7 +590,7 @@ index b697b9ee..67192636 100644
      opened = true;
      return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 diff --git a/zig/src/native/cuda_vision_offer.zig b/zig/src/native/cuda_vision_offer.zig
-index 56b8ac6d..67d1381c 100644
+index 56b8ac6d..e7cb489d 100644
 --- a/zig/src/native/cuda_vision_offer.zig
 +++ b/zig/src/native/cuda_vision_offer.zig
 @@ -3,16 +3,60 @@ const std = @import("std");
@@ -583,7 +624,7 @@ index 56b8ac6d..67d1381c 100644
 +            .group_open = x.marks.open,
 +            .group_close = x.marks.close,
 +            .markers = &x.mark_ids,
-+            .video_tokens = o.video_tokens,
++            .video_tokens = @min(o.video_tokens, x.limits.video_tokens),
 +            .max_videos = o.max_videos,
 +            .max_frames = o.max_frames,
 +        };
@@ -658,18 +699,30 @@ index a8317c98..e094bdae 100644
  }
  
 diff --git a/zig/src/server/images.zig b/zig/src/server/images.zig
-index 141424fd..3878e629 100644
+index 141424fd..e50cf508 100644
 --- a/zig/src/server/images.zig
 +++ b/zig/src/server/images.zig
-@@ -153,6 +153,7 @@ pub fn markerText(text: model_text.Text, a: std.mem.Allocator, v: api.Vision) ![
+@@ -146,13 +146,18 @@ fn refusal(cx: *Cx, v: api.Vision, i: usize, err: anyerror) errors.Refused {
+ /// A quoted marker's stand-in while the template renders: two private-use code points, the second naming the marker.
+ const sentinel = "\u{F0000}";
+ 
+-/// The image markers' text (Vision.markers), longest first so one never matches inside another.
++/// Media marker spellings, longest first so one never matches inside another.
+ pub fn markerText(text: model_text.Text, a: std.mem.Allocator, v: api.Vision) ![]const []const u8 {
+     var out: std.ArrayList([]const u8) = .empty;
+     for (v.markers) |id| {
          const s = try text.tokenString(a, id);
          if (s.len > 0) try out.append(a, s);
      }
-+    if (v.video) |o| if (o.video_text.len > 0) try out.append(a, o.video_text); // user text that spells it stays text
++    if (v.video) |o| {
++        const s = try text.tokenString(a, o.video_token);
++        if (s.len > 0) try out.append(a, s);
++        if (o.video_text.len > 0 and !std.mem.eql(u8, o.video_text, s)) try out.append(a, o.video_text);
++    }
      std.mem.sort([]const u8, out.items, {}, struct {
          fn longer(_: void, x: []const u8, y: []const u8) bool {
              return x.len > y.len;
-@@ -238,7 +239,7 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
+@@ -238,7 +243,7 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
      if (video_marks != n_videos) return cx.fail(.server, "the chat template wrote {d} video placeholders for {d} video parts", .{ video_marks, n_videos });
      if (ps.len == 0) return null;
      if (n_images > v.max_images) return cx.refuse(try std.fmt.allocPrint(cx.a, "a request may hold at most {d} images (--vision-max-images); it has {d}", .{ v.max_images, n_images }));
@@ -678,7 +731,7 @@ index 141424fd..3878e629 100644
      const budget: u32 = if (n_images > 0) v.image_tokens / @as(u32, @intCast(n_images)) else 0;
      if (n_images > 0 and budget < 1) return cx.refuse("the image count exceeds the visual-token budget");
      const prepared = try cx.a.alloc(api.PreparedImage, n_images);
-@@ -293,12 +294,18 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
+@@ -293,12 +298,18 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
              const o = v.video.?;
              const clip = clips[kv];
              kv += 1;
@@ -698,6 +751,124 @@ index 141424fd..3878e629 100644
                  var buf: [64]u8 = undefined;
                  const words = videos.seconds(&buf, secs) catch unreachable; // a time within the hour's limit
                  const time = text.encodePlain(cx.a, words) catch |e| return if (e == error.OutOfMemory) error.OutOfMemory else cx.fail(.server, "the tokenizer could not encode a video group's time", .{});
+diff --git a/zig/src/server/images_video_marker_test.zig b/zig/src/server/images_video_marker_test.zig
+new file mode 100644
+index 00000000..6fa24c64
+--- /dev/null
++++ b/zig/src/server/images_video_marker_test.zig
+@@ -0,0 +1,112 @@
++//! Video marker spellings stay ordinary in user text; only a template's own placeholder becomes a video.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json");
++const images = @import("images.zig");
++const model_text = @import("model_text.zig");
++const Cx = @import("errors.zig").Cx;
++const Value = json.Value;
++
++const VideoText = struct {
++    const table = blk: {
++        var v = images.MarkText.text().vtable.*;
++        v.encode = encode;
++        v.token_string = tokenString;
++        break :blk v;
++    };
++    fn text() model_text.Text {
++        return .{ .ctx = undefined, .vtable = &table };
++    }
++    fn encode(_: *anyopaque, a: std.mem.Allocator, s: []const u8, _: bool) model_text.Error![]u32 {
++        var out: std.ArrayList(u32) = .empty;
++        var rest = s;
++        while (std.mem.indexOf(u8, rest, "<SPECIAL_30>")) |at| {
++            try out.appendSlice(a, try images.MarkText.text().encode(a, rest[0..at], false));
++            try out.append(a, 8);
++            rest = rest[at + "<SPECIAL_30>".len ..];
++        }
++        try out.appendSlice(a, try images.MarkText.text().encode(a, rest, false));
++        return out.items;
++    }
++    fn plain(_: *anyopaque, a: std.mem.Allocator, s: []const u8) model_text.Error![]u32 {
++        return images.MarkText.text().encodePlain(a, s);
++    }
++    fn tokenString(_: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
++        return if (id == 8) a.dupe(u8, "<SPECIAL_30>") else images.MarkText.text().tokenString(a, id);
++    }
++};
++
++fn noImage(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: u32) anyerror!api.PreparedImage {
++    return error.UnexpectedImageDecode;
++}
++fn noVideo(_: *anyopaque, _: std.mem.Allocator, _: api.VideoSource, _: u32, _: u32) anyerror!api.PreparedVideo {
++    return error.UnexpectedVideoDecode;
++}
++
++const VideoPrompt = struct { vision: api.Vision, messages: Value, ids: []const u32 };
++
++/// The prompt path with one optional real video and both spellings in the user's text, without a decoder.
++fn videoUserPrompt(a: std.mem.Allocator, ctx: *anyopaque, real: bool, alias: []const u8) !VideoPrompt {
++    const v: api.Vision = .{ .ctx = ctx, .prepare = noImage, .image_token = 9, .markers = &.{ 9, 6, 7 }, .image_tokens = 64, .max_images = 4, .video = .{ .prepare = noVideo, .video_token = 8, .video_text = alias, .group_open = 6, .group_close = 7, .markers = &.{ 9, 6, 7 }, .video_tokens = 64, .max_videos = 2, .max_frames = 256 } };
++    const body = if (real)
++        \\[{"role":"user","content":[{"type":"video_url","video_url":{"url":"data:video/mp4;base64,YQ=="}},{"type":"text","text":"what are <video> and <SPECIAL_30>?"}]}]
++    else
++        \\[{"role":"user","content":[{"type":"text","text":"what are <video> and <SPECIAL_30>?"}]}]
++    ;
++    const msgs = switch (try json.parseText(a, body)) {
++        .ok => |m| m,
++        .err => return error.TestUnexpectedResult,
++    };
++    const markers = try images.markerText(VideoText.text(), a, v);
++    const shielded = try images.shield(a, msgs, markers);
++    var rendered: std.ArrayList(u8) = .empty;
++    for (shielded.array[0].get("content").?.array) |part| {
++        const kind = part.get("type").?.string;
++        try rendered.appendSlice(a, if (std.mem.eql(u8, kind, "video_url")) (if (alias.len > 0) alias else "<SPECIAL_30>") else part.get("text").?.string);
++    }
++    const replaced = if (alias.len > 0) try std.mem.replaceOwned(u8, a, rendered.items, alias, try VideoText.tokenString(undefined, a, v.video.?.video_token)) else rendered.items;
++    return .{ .vision = v, .messages = msgs, .ids = try images.encodeShielded(VideoText.text(), a, replaced, markers) };
++}
++
++test "literal video spellings in a text-only message never become video placeholders" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var dummy: u8 = 0;
++    const p = try videoUserPrompt(a, &dummy, false, "<video>");
++    var cx: Cx = .{ .a = a };
++    const expanded = images.expand(p.vision, null, VideoText.text(), &cx, p.messages, p.ids, 0) catch |err| {
++        std.debug.print("text-only request: {s}\n", .{cx.message});
++        return err;
++    };
++    try std.testing.expect(expanded == null);
++    try std.testing.expectEqualSlices(u32, try VideoText.plain(undefined, a, "what are <video> and <SPECIAL_30>?"), p.ids);
++}
++
++test "one real video beside both literal spellings produces exactly one video placeholder" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var dummy: u8 = 0;
++    const p = try videoUserPrompt(a, &dummy, true, "<video>");
++    try std.testing.expectEqual(@as(usize, 1), std.mem.countScalar(u32, p.ids, 8));
++    try std.testing.expectEqual(@as(u32, 8), p.ids[0]);
++    try std.testing.expectEqualSlices(u32, try VideoText.plain(undefined, a, "what are <video> and <SPECIAL_30>?"), p.ids[1..]);
++}
++
++test "empty and identical video aliases keep the token spelling protected and the template marker intact" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    var dummy: u8 = 0;
++    for ([_][]const u8{ "", "<SPECIAL_30>" }) |alias| for ([_]bool{ false, true }) |real| {
++        const p = try videoUserPrompt(a, &dummy, real, alias);
++        try std.testing.expectEqual(@as(usize, @intFromBool(real)), std.mem.countScalar(u32, p.ids, 8));
++        const from: usize = @intFromBool(real);
++        try std.testing.expectEqualSlices(u32, try VideoText.plain(undefined, a, "what are <video> and <SPECIAL_30>?"), p.ids[from..]);
++        if (!real) {
++            var cx: Cx = .{ .a = a };
++            try std.testing.expect((try images.expand(p.vision, null, VideoText.text(), &cx, p.messages, p.ids, 0)) == null);
++        }
++    };
++}
 diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
 index 48e058b0..e986dd71 100644
 --- a/zig/src/server/prompt.zig
@@ -715,6 +886,18 @@ index 48e058b0..e986dd71 100644
      return images.encodeShielded(srv.text, a, text, markers);
  }
  
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 381c864a..28956211 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -43,6 +43,7 @@ test {
+     _ = @import("request_log.zig");
+     _ = @import("messages.zig");
+     _ = @import("images.zig");
++    _ = @import("images_video_marker_test.zig");
+     _ = @import("image_key.zig");
+     _ = @import("media_fetch.zig");
+     _ = @import("videos.zig");
 diff --git a/zig/src/server/videos.zig b/zig/src/server/videos.zig
 index 9679475a..8a73c74e 100644
 --- a/zig/src/server/videos.zig

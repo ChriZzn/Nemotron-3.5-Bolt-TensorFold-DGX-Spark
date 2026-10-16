@@ -9,6 +9,13 @@ The Bolt backend serves the checkpoint. Measured on one GB10: decode 4.3 tok/s t
 LiLiCorr, greedy chat or code), 55 to 60 sampled; prefill 4.5 tok/s to 1,300 to 1,470 (from 1k to 50k tokens);
 sixteen streams at once, 167 tok/s aggregate sampled and 172 greedy.
 
+### Review fixes for video
+
+- User text that spells the video token (`<SPECIAL_30>`) or `<video>` stays text: it no longer turns a text-only request
+  into a refused one, or counts a second placeholder beside a real video (patch by cwschroeder, in `patches/0003`).
+- The rows buffer of an Omni checkpoint holds both a request's image and video budgets, so a long video, or a video
+  beside an image, no longer fails with `ImageRows`; Bolt's piecewise path was not affected.
+
 ### Concurrent replies equal solo ones
 
 A stream's replies used to depend on the batch it ran in: `bench_concurrent.py --alone` found every prose ("chat") reply

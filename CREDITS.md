@@ -16,6 +16,9 @@
   Q8_0 formats the checkpoint is packed in, and the IQ2_XXS tables in `engine/iq2_tables.inc`.
 - [FFmpeg](https://ffmpeg.org) 9.0.2 (decoders only, built from source) inside `libtfvideo`, and
   [libjpeg-turbo](https://libjpeg-turbo.org) 3.1.4.1, which the image builds for TensorFold's JPEG decoder.
+- Christian Schröder ([cwschroeder](https://github.com/cwschroeder)) reviewed the video change for TensorFold
+  ([#940](https://github.com/ashhart/TensorFold/pull/940)): the patch that keeps user text spelling the video token
+  ordinary (and its tests) is theirs, carried in `patches/0003`, and their reproducer found the rows-buffer sizing bug fixed there.
 - [Zig](https://ziglang.org) 0.17.0 by the Zig Software Foundation and the Zig contributors.
 - NVIDIA's [PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) `26.07-py3`, the image
   base. Its license is in [`NOTICE`](NOTICE).
