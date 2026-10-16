@@ -1,0 +1,309 @@
+{
+  "model_id": "nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB",
+  "revision": "a326822af111290f2af5ac59ef4b5040347dabc4",
+  "disk_bytes": 24102448875,
+  "shards": 90,
+  "top_model_type": "nemotron_h_omni",
+  "llm_model_type": "nemotron_h_puzzle",
+  "architectures": [
+    "NemotronH_Omni_Reasoning_V3"
+  ],
+  "hidden": 4096,
+  "vocab": 131072,
+  "max_position_embeddings": 262144,
+  "layers": 88,
+  "pattern": "MEMEMEMAEMEMEMEMAEMEMEMEMAEMEMEMEMEMAEMEMEMEMEMAEMEMEMEMEMAEMEMEMEMEMAEMEMEMEMAEMEMEMEME",
+  "mamba_layers": 40,
+  "moe_layers": 40,
+  "attention_layers": 8,
+  "mamba_num_heads": 128,
+  "mamba_head_dim": 64,
+  "n_groups": 8,
+  "ssm_state_size": 128,
+  "conv_kernel": 4,
+  "mamba_ssm_cache_dtype": "float32",
+  "num_attention_heads": 32,
+  "num_key_value_heads": 2,
+  "head_dim": 128,
+  "moe_latent_size": 1024,
+  "shared_expert_width": 5376,
+  "n_shared_experts": 1,
+  "top_k": 9,
+  "routed_scaling_factor": 5.0,
+  "scoring_func": "sigmoid",
+  "hidden_act": "relu2",
+  "norm_topk_prob": true,
+  "eos_token_id": 11,
+  "llm_eos_token_id": 2,
+  "bos_token_id": 1,
+  "quant_method": "modelopt",
+  "quant_algo": "MIXED_PRECISION",
+  "quant_counts": {
+    "Q8_0": 113,
+    "W4A16_NVFP4": 80,
+    "IQ2_XXS": 27728
+  },
+  "quant_roles": {
+    "IQ2_XXS": "routed and shared experts, ggml packing, group 256, 2.0625 bits",
+    "W4A16_NVFP4": "Mamba in_proj and out_proj, group 16",
+    "Q8_0": "attention q/k/v/o, latent fc1/fc2, lm_head, ggml packing, group 32"
+  },
+  "moe_schedule": [
+    {
+      "layer": 1,
+      "experts": 240,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 3,
+      "experts": 240,
+      "width": 1536,
+      "top_k": 9
+    },
+    {
+      "layer": 5,
+      "experts": 240,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 8,
+      "experts": 304,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 10,
+      "experts": 240,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 12,
+      "experts": 240,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 14,
+      "experts": 240,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 17,
+      "experts": 304,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 19,
+      "experts": 304,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 21,
+      "experts": 432,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 23,
+      "experts": 432,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 26,
+      "experts": 240,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 28,
+      "experts": 432,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 30,
+      "experts": 304,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 32,
+      "experts": 304,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 34,
+      "experts": 432,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 37,
+      "experts": 368,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 39,
+      "experts": 368,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 41,
+      "experts": 368,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 43,
+      "experts": 432,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 45,
+      "experts": 368,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 48,
+      "experts": 496,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 50,
+      "experts": 432,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 52,
+      "experts": 240,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 54,
+      "experts": 368,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 56,
+      "experts": 368,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 59,
+      "experts": 304,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 61,
+      "experts": 240,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 63,
+      "experts": 240,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 65,
+      "experts": 240,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 67,
+      "experts": 240,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 70,
+      "experts": 368,
+      "width": 2048,
+      "top_k": 9
+    },
+    {
+      "layer": 72,
+      "experts": 368,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 74,
+      "experts": 432,
+      "width": 2304,
+      "top_k": 9
+    },
+    {
+      "layer": 76,
+      "experts": 432,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 79,
+      "experts": 496,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 81,
+      "experts": 432,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 83,
+      "experts": 432,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 85,
+      "experts": 496,
+      "width": 2560,
+      "top_k": 9
+    },
+    {
+      "layer": 87,
+      "experts": 368,
+      "width": 2560,
+      "top_k": 9
+    }
+  ],
+  "vision": {
+    "model_type": "radio",
+    "hidden_size": 1280,
+    "num_hidden_layers": 32,
+    "num_attention_heads": 16,
+    "patch_size": 16,
+    "image_size": 224,
+    "model": "vit_huge_patch16_224",
+    "image_tag_type": "internvl",
+    "force_image_size": 512
+  },
+  "sampling": {
+    "temperature": 1.0,
+    "top_p": 0.95
+  },
+  "attention_kv_bytes_per_token_bf16": 8192
+}

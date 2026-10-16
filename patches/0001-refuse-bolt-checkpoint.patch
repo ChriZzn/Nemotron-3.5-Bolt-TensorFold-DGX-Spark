@@ -1,0 +1,50 @@
+diff --git a/zig/src/families/nemotron/config.zig b/zig/src/families/nemotron/config.zig
+index aec6e20..c2727d3 100644
+--- a/zig/src/families/nemotron/config.zig
++++ b/zig/src/families/nemotron/config.zig
+@@ -221,12 +221,30 @@ fn learned(path: []const u8) bool {
+     return false;
+ }
+ 
++fn typeName(o: std.json.ObjectMap) []const u8 {
++    const v = o.get("model_type") orelse return "";
++    return if (v == .string) v.string else "";
++}
++
++/// NVIDIA's Bolt 24GB export: an omni wrapper around nemotron_h_puzzle.
++fn boltCheckpoint(o: std.json.ObjectMap) bool {
++    const top = typeName(o);
++    if (std.mem.eql(u8, top, "nemotron_h_omni") or std.mem.eql(u8, top, "nemotron_h_puzzle")) return true;
++    if (o.get("llm_config")) |v| if (v == .object and std.mem.eql(u8, typeName(v.object), "nemotron_h_puzzle")) return true;
++    return false;
++}
++
+ /// config.json's text; a refusal's reason goes to `why`.
+ pub fn parse(allocator: std.mem.Allocator, text: []const u8, why: *Why) !Config {
+     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, text, .{});
+     defer parsed.deinit();
+     const o = parsed.value.object;
+-    if (!std.mem.eql(u8, (o.get("model_type") orelse return error.BadConfig).string, "nemotron_h")) return error.NotNemotronH;
++    if (o.get("model_type") == null) return error.BadConfig;
++    if (boltCheckpoint(o)) {
++        why.set("Nemotron 3.5 Bolt (nemotron_h_puzzle): IQ2_XXS experts, NVFP4 Mamba, Q8_0 attention and latent projections, per-layer expert counts. The native Nemotron family serves Lightning 30B-A3B", .{});
++        return error.UnsupportedCheckpoint;
++    }
++    if (!std.mem.eql(u8, typeName(o), "nemotron_h")) return error.NotNemotronH;
+     var c = Config{
+         .hidden = try int(o, "hidden_size"),
+         .vocab = try int(o, "vocab_size"),
+@@ -372,3 +390,13 @@ test "parse the Lightning config" {
+     try std.testing.expectEqual(std.math.inf(f32), c.dt_max);
+     try checkShapes(c);
+ }
++
++test "a Bolt omni checkpoint is refused by name, before Lightning's shape check" {
++    const text =
++        \\{"model_type":"nemotron_h_omni","llm_config":{"model_type":"nemotron_h_puzzle","hidden_size":4096}}
++    ;
++    var why: Why = .{};
++    try std.testing.expectError(error.UnsupportedCheckpoint, parse(std.testing.allocator, text, &why));
++    try std.testing.expect(std.mem.indexOf(u8, why.text(), "Bolt") != null);
++    try std.testing.expect(std.mem.indexOf(u8, why.text(), "Lightning") != null);
++}

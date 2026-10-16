@@ -1,0 +1,389 @@
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 903dc4d..2f5805a 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -46,6 +46,12 @@ pub const Structure = struct {
+ 
+ pub const grammar = lanes.grammar;
+ 
++/// Pictures in a request (see lanes/media.zig): decoded by the engine's hooks, their tokens located by the server.
++pub const Picture = lanes.media.Picture;
++pub const Media = lanes.media.Media;
++pub const MediaSet = lanes.media.MediaSet;
++pub const MediaHooks = lanes.media.Hooks;
++
+ /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
+ pub const Request = struct {
+     prompt: []const u32,
+@@ -88,6 +94,8 @@ pub const Request = struct {
+     logprobs: ?u8 = null,
+     /// Rows for each prompt token after the first, with ranks and this many best tokens, when ``Info.prompt_logprobs``.
+     prompt_logprobs: ?u8 = null,
++    /// The pictures of the prompt, with where their tokens sit (null: text only).
++    media: ?*const MediaSet = null,
+ };
+ 
+ pub const Reason = enum { stop, length, cancelled, failed };
+@@ -164,6 +172,8 @@ pub const Info = struct {
+     greedy_only: bool = false,
+     /// Whether a request's caches fit beside the running streams' now (null: a free lane does); else it waits in order.
+     admit: ?Admit = null,
++    /// The engine reads pictures: the server accepts image and video parts and expands them through these hooks.
++    media: ?MediaHooks = null,
+ };
+ 
+ pub const Admit = struct {
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 4394fda..33c5543 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -337,6 +337,7 @@ pub const LaneHost = struct {
+             .history_len = r.history_len,
+             .shared_prefixes = r.shared_prefixes,
+             .reuse = reuse,
++            .media = r.media,
+             .grammar = if (r.structure) |st| h.constraint(st) catch |e| {
+                 job.proposer.deinit();
+                 return h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+diff --git a/zig/src/core/lanes/lanes.zig b/zig/src/core/lanes/lanes.zig
+index 5d50a16..1cbef2c 100644
+--- a/zig/src/core/lanes/lanes.zig
++++ b/zig/src/core/lanes/lanes.zig
+@@ -26,6 +26,7 @@ pub const drafter = @import("drafter.zig");
+ pub const drafted = @import("drafted.zig");
+ pub const logprob = @import("logprob.zig");
+ pub const grammar = @import("grammar.zig");
++pub const media = @import("media.zig");
+ 
+ pub const Engine = engine.Engine;
+ pub const Config = config.Config;
+diff --git a/zig/src/core/lanes/media.zig b/zig/src/core/lanes/media.zig
+new file mode 100644
+index 0000000..13d1704
+--- /dev/null
++++ b/zig/src/core/lanes/media.zig
+@@ -0,0 +1,42 @@
++//! Pictures in a request: what an engine that reads them decodes, and the hooks the server uses to lay them out in a prompt.
++const std = @import("std");
++const Allocator = std.mem.Allocator;
++
++/// A decoded picture: RGB8, rows top to bottom, `width * height * 3` bytes.
++pub const Picture = struct { rgb: []const u8, width: u32, height: u32 };
++
++/// One image or video of a request, as its engine's hooks decoded it. The prompt names its tokens with placeholders;
++/// `runs` (set by the server once the prompt is tokenized) say where, as [start, count) of prompt rows.
++pub const Media = struct {
++    kind: enum { image, video },
++    /// One picture for an image; for a video an even number of frames, two to a tubelet.
++    frames: []const Picture,
++    /// The patch grid every frame is resized to (columns, rows of 16 pixels).
++    cols: u32,
++    rows: u32,
++    /// Prompt tokens the whole item takes, and how many runs they come in (an image: one; a video: one per tubelet).
++    tokens: u32,
++    groups: u32 = 1,
++    /// A video's sampling time of each frame in seconds (empty: unknown).
++    times: []const f32 = &.{},
++    runs: []const [2]u32 = &.{},
++};
++
++pub const MediaSet = struct { items: []Media };
++
++/// What an engine that reads pictures gives the server: decoding, and the prompt text that stands for an item.
++pub const Hooks = struct {
++    ctx: *anyopaque,
++    /// An image file's bytes (JPEG, PNG, BMP or GIF) as a Media; slices are allocated in `a`.
++    image: *const fn (ctx: *anyopaque, a: Allocator, bytes: []const u8) anyerror!Media,
++    /// A video file's bytes as sampled frames.
++    video: *const fn (ctx: *anyopaque, a: Allocator, bytes: []const u8) anyerror!Media,
++    /// The prompt text for an item: `index` of `count` pictures in its message (the labels the chat template wants),
++    /// with the placeholder token spelled out once for every token the item takes.
++    text: *const fn (ctx: *anyopaque, a: Allocator, item: *const Media, index: u32, count: u32) anyerror![]const u8,
++    /// The placeholder's token id, and the ids the server may swap a run's placeholders for so that two pictures of one
++    /// size never share a prompt-cache key (the engine reads positions from `runs`, not ids).
++    placeholder: u32,
++    salt_first: u32,
++    salt_count: u32,
++};
+diff --git a/zig/src/core/lanes/stream.zig b/zig/src/core/lanes/stream.zig
+index f028d10..ec1856e 100644
+--- a/zig/src/core/lanes/stream.zig
++++ b/zig/src/core/lanes/stream.zig
+@@ -117,6 +117,7 @@ pub const Spec = struct {
+     history_len: u32 = 0, // prompt prefix lengths a backend may keep for a later turn: the rendered history,
+     shared_prefixes: []const u32 = &.{}, // then shared system blocks
+     reuse: Reuse = .{},
++    media: ?*const @import("media.zig").MediaSet = null, // the request's pictures, with where their tokens sit
+     decide: ?u32 = null, // the prompt row where living lessons decide whether they act on the reply
+     untaught: bool = false, // no learned neuron acts on its rows: the model as shipped (Request.untaught)
+     logprobs: ?u8 = null, // the target's log probabilities for each committed token, with this many best tokens
+@@ -152,6 +153,7 @@ pub const Stream = struct {
+     prompt_logprobs: ?u8 = null,
+     prompt_rows: std.ArrayList(Row) = .empty, // with `prompt_logprobs`: one a prompt token after the first, in order
+     reuse: Reuse = .{},
++    media: ?*const @import("media.zig").MediaSet = null,
+     decode_spans: []const [2]u32 = &.{},
+     decide: ?u32 = null,
+     untaught: bool = false,
+@@ -210,6 +212,7 @@ pub const Stream = struct {
+             .history_len = spec.history_len,
+             .shared_prefixes = spec.shared_prefixes,
+             .reuse = spec.reuse,
++            .media = spec.media,
+             .decide = spec.decide,
+             .untaught = spec.untaught,
+             .logprobs = spec.logprobs,
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 0b1afa2..9aa5577 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -398,11 +398,16 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         gpa.free(h.dir);
+     };
+     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .warm_turns = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .prompt_logprobs = loaded.backend.vtable.prompt_rows, .structures = loaded.backend.vtable.first_masked != null }, .{ .ctx = loaded.ctx, .text = F.explain });
++    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prompt_cache = h.store != null, .warm_turns = h.store != null, .logprobs = loaded.backend.vtable.first_row != null, .prompt_logprobs = loaded.backend.vtable.prompt_rows, .structures = loaded.backend.vtable.first_masked != null, .media = mediaOf(loaded) }, .{ .ctx = loaded.ctx, .text = F.explain });
+     opened = true;
+     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+ }
+ 
++/// A family that reads pictures hands its media hooks to the server (families without any leave them null).
++fn mediaOf(loaded: anytype) ?api.MediaHooks {
++    return if (@hasField(@TypeOf(loaded), "media")) loaded.media else null;
++}
++
+ fn toGib(bytes: u64) f64 {
+     return @as(f64, @floatFromInt(bytes)) / gib;
+ }
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 7c702ef..0df2ac5 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -8,6 +8,7 @@ const reply_text = @import("reply_text.zig");
+ const tool_stream = @import("tool_stream.zig");
+ const tool_parse = @import("tool_parse.zig");
+ const prompt_mod = @import("prompt.zig");
++const media_mod = @import("media.zig");
+ const log = @import("log.zig");
+ const ids = @import("ids.zig");
+ const clock = @import("clock.zig");
+@@ -35,6 +36,8 @@ pub const Input = struct {
+     logprobs: ?u8 = null,
+     /// ``/v1/completions``' ``prompt_logprobs``: rows for the prompt with this many alternatives; null: not asked.
+     prompt_logprobs: ?u8 = null,
++    /// The pictures of the messages (decoded by the engine's media hooks), in prompt order.
++    media: []const api.Media = &.{},
+ };
+ 
+ /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
+@@ -143,6 +146,13 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
+     };
+     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
++    if (input.media.len > 0) {
++        // the placeholder runs get ids salted by their pictures, so no prompt-cache key is shared by two different ones
++        const hooks = srv.info.media orelse return cx.refuse("this engine reads text only");
++        const bound = try media_mod.bind(cx, hooks, input.media, rendered.ids);
++        request.prompt = bound.ids;
++        request.media = bound.set;
++    }
+     if (thinking) {
+         const budget_field = f.get("thinking_budget");
+         const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
+diff --git a/zig/src/server/errors.zig b/zig/src/server/errors.zig
+index c18c443..d6857bd 100644
+--- a/zig/src/server/errors.zig
++++ b/zig/src/server/errors.zig
+@@ -24,6 +24,8 @@ pub const Cx = struct {
+     a: Allocator,
+     kind: Kind = .request,
+     message: []const u8 = "",
++    /// The request's media collector (server/media.zig) while its messages are normalized; null: text only.
++    media: ?*anyopaque = null,
+ 
+     pub fn fail(cx: *Cx, kind: Kind, comptime fmt: []const u8, args: anytype) Refused {
+         cx.kind = kind;
+diff --git a/zig/src/server/media.zig b/zig/src/server/media.zig
+new file mode 100644
+index 0000000..854abf6
+--- /dev/null
++++ b/zig/src/server/media.zig
+@@ -0,0 +1,112 @@
++//! Pictures in chat messages. An image_url or video_url part is decoded by the engine's media hooks and replaced, in the
++//! message text, by the prompt text the hooks give for it (placeholder tokens included); the decoded pictures ride with the
++//! request, and once the prompt is tokenized `bind` finds where each picture's tokens sit.
++const std = @import("std");
++const api = @import("engine_api");
++const json = @import("json.zig");
++const errors = @import("errors.zig");
++const Value = json.Value;
++const Cx = errors.Cx;
++
++/// The media of the request being planned; `Cx.media` points at it while its messages are normalized.
++pub const Collector = struct {
++    hooks: api.MediaHooks,
++    items: std.ArrayList(api.Media) = .empty,
++    /// Pictures one request may carry.
++    max_items: usize = 64,
++};
++
++pub fn collector(cx: *Cx) ?*Collector {
++    return if (cx.media) |p| @ptrCast(@alignCast(p)) else null;
++}
++
++pub const Kind = enum { image, video };
++
++/// Whether a content part is a picture: OpenAI's image_url / video_url (and the Responses API's input_image / input_video).
++pub fn kindOf(part: Value) ?Kind {
++    if (part != .object) return null;
++    const t = part.get("type") orelse return null;
++    if (t != .string) return null;
++    if (std.mem.eql(u8, t.string, "image_url") or std.mem.eql(u8, t.string, "input_image") or std.mem.eql(u8, t.string, "image")) return .image;
++    if (std.mem.eql(u8, t.string, "video_url") or std.mem.eql(u8, t.string, "input_video") or std.mem.eql(u8, t.string, "video")) return .video;
++    return null;
++}
++
++/// The part's data URL: {"image_url": {"url": ...}}, {"image_url": "..."} or {"video_url": ...} alike.
++fn urlOf(part: Value, kind: Kind) ?[]const u8 {
++    const key = if (kind == .image) "image_url" else "video_url";
++    const v = part.get(key) orelse part.get(if (kind == .image) "image" else "video") orelse return null;
++    if (v == .string) return v.string;
++    if (v == .object) if (v.get("url")) |u| if (u == .string) return u.string;
++    return null;
++}
++
++/// The bytes of a base64 data URL; remote URLs are refused (a server other machines reach never fetches for its clients).
++fn dataUrl(cx: *Cx, url: []const u8) errors.Refused![]const u8 {
++    if (!std.mem.startsWith(u8, url, "data:")) return cx.refuse("pictures must be sent as base64 data URLs (data:image/png;base64,...); remote URLs are not fetched");
++    const comma = std.mem.indexOfScalar(u8, url, ',') orelse return cx.refuse("a picture's data URL has no payload");
++    if (std.mem.indexOf(u8, url[0..comma], ";base64") == null) return cx.refuse("a picture's data URL must be base64");
++    const payload = url[comma + 1 ..];
++    // tolerate the line breaks some clients put in
++    var clean: std.ArrayList(u8) = .empty;
++    for (payload) |c| if (c != '\n' and c != '\r' and c != ' ') try clean.append(cx.a, c);
++    const dec = std.base64.standard.Decoder;
++    const n = dec.calcSizeForSlice(clean.items) catch return cx.refuse("a picture's base64 payload is invalid");
++    const out = try cx.a.alloc(u8, n);
++    dec.decode(out, clean.items) catch return cx.refuse("a picture's base64 payload is invalid");
++    return out;
++}
++
++/// Decode one picture part, remember it, and append its prompt text. `index` of `count` pictures in the message.
++pub fn append(cx: *Cx, c: *Collector, part: Value, kind: Kind, text: *std.ArrayList(u8), index: u32, count: u32) errors.Refused!void {
++    if (c.items.items.len >= c.max_items) return cx.fail(.request, "a request may carry at most {d} images and videos", .{c.max_items});
++    const url = urlOf(part, kind) orelse return cx.refuse("an image or video part needs a data URL");
++    const bytes = try dataUrl(cx, url);
++    const item = (switch (kind) {
++        .image => c.hooks.image(c.hooks.ctx, cx.a, bytes),
++        .video => c.hooks.video(c.hooks.ctx, cx.a, bytes),
++    }) catch |e| return cx.fail(.request, "the {s} could not be read ({s}); images are JPEG, PNG, BMP or GIF, videos need ffmpeg", .{ @tagName(kind), @errorName(e) });
++    try c.items.append(cx.a, item);
++    const s = c.hooks.text(c.hooks.ctx, cx.a, &c.items.items[c.items.items.len - 1], index, count) catch |e| return cx.fail(.request, "the {s} could not be laid out ({s})", .{ @tagName(kind), @errorName(e) });
++    try text.appendSlice(cx.a, s);
++}
++
++fn mix(x0: u64) u64 {
++    var x = x0 +% 0x9e3779b97f4a7c15;
++    x = (x ^ (x >> 30)) *% 0xbf58476d1ce4e5b9;
++    x = (x ^ (x >> 27)) *% 0x94d049bb133111eb;
++    return x ^ (x >> 31);
++}
++
++pub const Bound = struct { ids: []const u32, set: *const api.MediaSet };
++
++/// The prompt's placeholder runs, in order, matched to the pictures; the placeholders swapped for ids salted by each
++/// group's pixels so a prompt-cache key names the picture. Refuses a prompt whose placeholders do not fit the pictures
++/// (a client that typed `<image>` itself).
++pub fn bind(cx: *Cx, hooks: api.MediaHooks, items: []const api.Media, ids: []const u32) errors.Refused!Bound {
++    const out = try cx.a.dupe(u32, ids);
++    const set = try cx.a.alloc(api.Media, items.len);
++    var at: usize = 0;
++    for (items, set) |item, *dst| {
++        dst.* = item;
++        const runs = try cx.a.alloc([2]u32, item.groups);
++        const per: u32 = item.tokens / item.groups;
++        var h: u64 = std.hash.Wyhash.hash(0x6d656469, std.mem.asBytes(&.{ item.cols, item.rows, item.tokens }));
++        for (item.frames) |f| h = std.hash.Wyhash.hash(h, f.rgb);
++        for (runs, 0..) |*run, g| {
++            while (at < out.len and out[at] != hooks.placeholder) at += 1;
++            if (at + per > out.len) return cx.refuse("the prompt has fewer image placeholders than its pictures need");
++            for (out[at .. at + per]) |t| if (t != hooks.placeholder) return cx.refuse("the prompt's image placeholders do not match its pictures (do not write <image> in the text)");
++            if (at + per < out.len and out[at + per] == hooks.placeholder) return cx.refuse("the prompt's image placeholders do not match its pictures (do not write <image> in the text)");
++            run.* = .{ @intCast(at), per };
++            for (0..per) |j| out[at + j] = hooks.salt_first + @as(u32, @intCast(mix(h ^ (@as(u64, g) << 40) ^ j) % hooks.salt_count));
++            at += per;
++        }
++        dst.runs = runs;
++    }
++    // placeholders left over mean text the client wrote
++    while (at < out.len) : (at += 1) if (out[at] == hooks.placeholder) return cx.refuse("the prompt has more image placeholders than pictures (do not write <image> in the text)");
++    const holder = try cx.a.create(api.MediaSet);
++    holder.* = .{ .items = set };
++    return .{ .ids = out, .set = holder };
++}
+diff --git a/zig/src/server/messages.zig b/zig/src/server/messages.zig
+index 9559ed7..61c9542 100644
+--- a/zig/src/server/messages.zig
++++ b/zig/src/server/messages.zig
+@@ -3,6 +3,7 @@ const std = @import("std");
+ const json = @import("json.zig");
+ const errors = @import("errors.zig");
+ const fields = @import("fields.zig");
++const media = @import("media.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ 
+@@ -36,7 +37,19 @@ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_
+         var item: *json.Object = message.object;
+         if (content != null and content.? == .array) {
+             var text: std.ArrayList(u8) = .empty;
++            var pictures: u32 = 0; // image parts of this message: with several, the template labels each <image N>
++            if (media.collector(cx) != null) for (content.?.array) |part| {
++                if (media.kindOf(part)) |k| if (k == .image) {
++                    pictures += 1;
++                };
++            };
++            var shown: u32 = 0;
+             for (content.?.array) |part| {
++                if (media.collector(cx)) |c| if (media.kindOf(part)) |k| {
++                    try media.append(cx, c, part, k, &text, shown, pictures);
++                    if (k == .image) shown += 1;
++                    continue;
++                };
+                 const typed = part == .object and part.get("type") != null and part.get("type").? == .string and std.mem.eql(u8, part.get("type").?.string, "text");
+                 if (!typed or fields.hasMedia(part)) return cx.refuse("this server accepts text parts only; image, audio and video inputs are unsupported");
+                 const t = part.get("text") orelse return cx.refuse("a text content part must contain a text string");
+diff --git a/zig/src/server/openai.zig b/zig/src/server/openai.zig
+index b8782aa..405c87d 100644
+--- a/zig/src/server/openai.zig
++++ b/zig/src/server/openai.zig
+@@ -7,6 +7,7 @@ const chat = @import("chat.zig");
+ const compact = @import("compact.zig");
+ const grammar = @import("grammar.zig");
+ const messages = @import("messages.zig");
++const media = @import("media.zig");
+ const tool_specs = @import("tool_specs.zig");
+ const tool_parse = @import("tool_parse.zig");
+ const tool_stream = @import("tool_stream.zig");
+@@ -120,6 +121,13 @@ const Plan = struct {
+ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     const body = try fields.parseNumbers(cx, raw);
+     try fields.validateModalities(cx, body);
++    // an engine that reads pictures takes image and video parts: they are decoded while the messages are normalized
++    var collected: media.Collector = undefined;
++    if (srv.info.media) |hooks| {
++        collected = .{ .hooks = hooks };
++        cx.media = &collected;
++    }
++    defer cx.media = null;
+     // rows need each token's exact bytes: a tokenizer whose decoding depends on context (null) can't give them
+     const asked = if (is_chat) json.truthyField(body, "logprobs") else body.field("logprobs") != null;
+     const exact_bytes = asked and srv.info.logprobs and (srv.text.tokenBytes(cx.a, 0) catch return error.OutOfMemory) != null;
+@@ -132,6 +140,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
+     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
+         input.messages = try messages.normalize(cx, m, "system", srv.needs_user_after_tool);
+     };
++    if (srv.info.media != null) input.media = collected.items.items;
+     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
+     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now
+     const first = body.get("max_tokens");

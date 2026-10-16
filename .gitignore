@@ -1,0 +1,27 @@
+# lab and per-machine files, never part of the repository
+work/
+scripts/local.sh
+.env
+.claude/
+AGENTS.md
+CLAUDE.md
+HANDOFF*.md
+handoff.md
+GOAL.md
+*HANDOFF*
+*-PROMPT.md
+*PROMPT*.md
+STATUS.md
+PLAN.md
+SUMMARY*.md
+NOTES*.md
+*.lab
+*.bak
+*.orig
+*.rej
+*.log
+__pycache__/
+engine/*.so
+
+# developer benches, kernel tests and lab scripts: kept locally, not published
+tools/

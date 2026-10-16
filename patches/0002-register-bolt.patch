@@ -1,0 +1,69 @@
+diff --git a/zig/src/families/nemotron/cuda.zig b/zig/src/families/nemotron/cuda.zig
+index cb2fa93..112b8c2 100644
+--- a/zig/src/families/nemotron/cuda.zig
++++ b/zig/src/families/nemotron/cuda.zig
+@@ -17,6 +17,7 @@ pub const Drafter = @import("cuda_drafts.zig").Drafter;
+ pub const Head = @import("cuda_mtp.zig").Head;
+ pub const Lanes = @import("cuda_lanes.zig").Cuda;
+ pub const native = @import("cuda_native.zig");
++pub const bolt = @import("bolt_native.zig");
+ pub const train = @import("cuda_train.zig");
+ pub const sites = @import("cuda_sites.zig");
+ pub const train_ops = @import("cuda_train_ops.zig");
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index 851f919..0b1afa2 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -10,7 +10,7 @@ const lane_backend = @import("cuda_bound.zig");
+ const nemotron_slide = @import("nemotron_slide.zig");
+ 
+ /// CUDA families provide metadata, open their lane backend and explain their refusals.
+-const registry = .{nemotron.native};
++const registry = .{ nemotron.native, nemotron.bolt };
+ 
+ /// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
+ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
+@@ -20,6 +20,14 @@ const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
+     .drop = nemotron.native.snap_drop,
+ };
+ 
++/// Bolt keeps its own copies: the Mamba state, the attention rows and the drafter's context (engine/bolt_native.zig).
++const bolt_snaps: api.prompt_cache.Snapshots.VTable = .{
++    .bytes = nemotron.bolt.snap_bytes,
++    .save = nemotron.bolt.snap_save,
++    .restore = nemotron.bolt.snap_restore,
++    .drop = nemotron.bolt.snap_drop,
++};
++
+ pub const backends: []const []const u8 = &.{"cuda"};
+ pub const families: []const api.Family = blk: {
+     var out: [registry.len]api.Family = undefined;
+@@ -353,18 +361,24 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
+         if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache", if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
+     });
+     errdefer gpa.free(h.startup);
+-    if (cache > 0) {
++    const is_bolt = comptime std.mem.eql(u8, F.model_type, nemotron.bolt.model_type);
++    if (cache > 0 and (is_bolt or std.mem.eql(u8, F.model_type, nemotron.native.model_type))) {
+         const pc = api.prompt_cache;
+         const store = try gpa.create(pc.Store);
+-        // states keep at any row at no prompt call (the head reads one token on); replies prefill when it is quiet
+-        store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &nemotron_snaps }, .{ .lookahead = 1, .min_prompt = 0, .warm = .waits }, cache - try nemotron.native.snap_ready(loaded.target, cache));
++        if (is_bolt) {
++            // no head reads a token ahead: a state keys at its own row; replies prefill when it is quiet
++            store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &bolt_snaps }, .{ .lookahead = 0, .min_prompt = 0, .warm = .waits }, cache);
++        } else {
++            // states keep at any row at no prompt call (the head reads one token on); replies prefill when it is quiet
++            store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &nemotron_snaps }, .{ .lookahead = 1, .min_prompt = 0, .warm = .waits }, cache - try nemotron.native.snap_ready(loaded.target, cache));
++        }
+         h.store = store;
+     }
+     errdefer if (h.store) |store| {
+         store.deinit();
+         gpa.destroy(store);
+     };
+-    if (loaded.learns != null) {
++    if (@hasDecl(F, "slide") and loaded.learns != null) {
+         const Slide = nemotron_slide.Adapter(F.slide);
+         h.dir = try gpa.dupe(u8, o.dir);
+         const s = try gpa.create(Slide);
