@@ -9,6 +9,41 @@ The Bolt backend serves the checkpoint. Measured on one GB10: decode 4.3 tok/s t
 LiLiCorr, greedy chat or code), 55 to 60 sampled; prefill 4.5 tok/s to 1,300 to 1,470 (from 1k to 50k tokens);
 sixteen streams at once, 167 tok/s aggregate sampled and 172 greedy.
 
+### Concurrent replies equal solo ones
+
+A stream's replies used to depend on the batch it ran in: `bench_concurrent.py --alone` found every prose ("chat") reply
+at four streams different from its solo run (0 of 12 equal), and code replies equal. The cause was not the GEMM kernels
+chosen by row count, as first written up; it was three batch-dependent summation orders, all fixed now:
+
+- **Attention key chunks.** A verify window merged partial softmaxes over key chunks sized by the number of streams in the
+  block (about 32 splits for one stream, 8 for four) and by the window's width. The chunk size is now `win_chunk(base)`
+  (128 keys, doubled until 32 chunks reach the sequence's end and window), a function of the sequence's own length.
+- **GEMM order.** Blocks of more than 32 rows used `mma_big_k`, which sums K in one sequence; smaller blocks used the
+  K-split kernel's four interleaved partials. Decode and verify blocks now always use the K-split kernel
+  (`mma_decode_rows`, 64 tokens a CTA); the prompt pass keeps `mma_big_k`.
+- **The plain step.** The non-speculative one-token step used the CUDA-core attention kernel; it now runs as a one-row
+  window (then kept), so drafted and plain decoding share one arithmetic.
+
+Tests: perplexity of passages scored alone and in blocks of 2, 3, 4, 8 and 16 streams with 8-row windows (up to 128 rows
+a block; also 1- and 5-row windows at four streams) is identical to five decimals; sixteen sequences match their solo
+runs for 768 of 768 tokens, plain steps and 4-row windows alike; `tools/bench_concurrent.py --alone --serial` on the production image
+(`--parallel 8`, greedy, 256 tokens, 3 repetitions):
+
+| prompt | streams | aggregate | each stream | concurrent equals solo | drafted equals `"draft": false` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| code | 1 | 115.1 tok/s | 115.1 tok/s | 3 of 3 | 1 of 1 |
+| code | 4 | 207.9 tok/s | 54.8 tok/s | 12 of 12 | 1 of 1 |
+| code | 8 | 252.6 tok/s | 35.2 tok/s | 24 of 24 | 1 of 1 |
+| chat | 1 | 60.7 tok/s | 60.7 tok/s | 3 of 3 | 1 of 1 |
+| chat | 4 | 139.1 tok/s | 35.6 tok/s | 12 of 12 | 1 of 1 |
+| chat | 8 | 174.7 tok/s | 23.6 tok/s | 24 of 24 | 1 of 1 |
+
+Perplexity on the 1,499-token passage is unchanged (5.286 one token at a time). Cost: the K-split kernel decodes the
+weights again for each 64-token group, so the widest shared rounds are slower, 16 streams of 8-row windows (128 rows)
+220.3 ms against 176.9 ms (about 25 %); a round of 64 rows is 130.4 ms against 135.5 ms for 8 streams of 8-row windows
+and 141.7 ms against 133.2 ms for 16 streams of 4-row windows. A 16-sequence round of one row each is unchanged
+(90.3 ms).
+
 ### TensorFold 1.0.12, images and video
 
 - **Rebased onto TensorFold 1.0.12.** Upstream now ships a RADIO tower and image input, so the recipe uses them: the
@@ -43,7 +78,8 @@ sixteen streams at once, 167 tok/s aggregate sampled and 172 greedy.
 - **Backend.** `prefill_step` (pieces of 2048 rows, 512 while other streams decode), `LaneMemory` when every sequence is
   busy, snapshots per stream, `draft_streams` and shared-round costs measured at load.
 - **Checks.** The unit tests cover attention including several windows in one launch; sixteen sequences decoded in one
-  block match their solo runs, and a stream's logits do not depend on its neighbours; the rollback check now compares
+  block match their solo runs, and a leak test compared a stream's logits across neighbours (it missed the batch-dependent
+  summation orders fixed under "Concurrent replies equal solo ones"); the rollback check now compares
   against a window of exactly the kept rows.
 
 - **fp8 KV cache.** `KV_DTYPE=fp8` stores K and V as e4m3 with a scale per token and head: 4,224 bytes a token instead

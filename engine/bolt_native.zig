@@ -290,7 +290,9 @@ const Engine = struct {
         };
         const ids = [1]c_int{@intCast(tok)};
         const k = candCount(s);
-        if (e.api.forward(e.model, slot.seq, &ids, 1, 0, k) != 0) return error.BoltForward;
+        // a one-row window, kept at once: the same attention arithmetic as every verify window, alone or among streams
+        if (e.api.forward(e.model, slot.seq, &ids, 1, 1, k) != 0) return error.BoltForward;
+        e.api.keep(e.model, slot.seq, 1);
         const next = try e.draw(s, 0, position, k);
         return e.remember(next);
     }

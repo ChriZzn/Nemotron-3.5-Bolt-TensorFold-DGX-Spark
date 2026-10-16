@@ -557,6 +557,7 @@ void prof_collect(Bolt* b) {
 }
 
 void enqueue_block(Bolt* b, int T, int record, int cand_k, int last_only, int nseg, int split_log) {
+    mma_decode_rows(record != 0);
     cudaStream_t s0 = b->s0, s1 = b->s1, s2 = b->s2;
     const Ctl* ctl = b->ctl_d;
     mark(b, "start");
@@ -649,16 +650,6 @@ void enqueue_block(Bolt* b, int T, int record, int cand_k, int last_only, int ns
 int bucket_of(int nseg) { return nseg <= 1 ? 0 : nseg <= 2 ? 1 : nseg <= 4 ? 2 : nseg <= 8 ? 3 : 4; }
 constexpr int BUCKET_SEGS[5] = {1, 2, 4, 8, 16};
 
-// Key splits of a verify window's attention: about 512 keys a CTA, in powers of two.
-// and at least enough CTAs (two KV heads times the splits per stream) to fill a good part of the GPU.
-int split_log_of(int maxlen, int nseg_launch) {
-    int sp = (maxlen + 511) / 512, lg = 0;
-    const int least = (64 + 2 * nseg_launch - 1) / (2 * nseg_launch);
-    if (sp < least) sp = least;
-    while ((1 << lg) < sp && lg < 5) lg++;
-    return lg;
-}
-
 int graph_key(int T, int record, int cand_k, int last_only, int bucket, int split_log) {
     return (((((T * 2 + record) * 2 + last_only) * 5 + bucket) * 6 + split_log) * 128) + cand_k;
 }
@@ -700,6 +691,18 @@ void flush_all_ingest(Bolt* b) {
 
 struct SegIn { int seq, rows; const int* tokens; };
 
+// CTAs a verify window's attention launches per stream and KV head, a power of two: the most any sequence needs at its
+// own win_chunk (the kernel gives each sequence the same key chunks whatever this is, so it changes no rounding).
+int split_log_of(const SegIn* sg, int nseg, const Bolt* b) {
+    int need = 1, lg = 0;
+    for (int i = 0; i < nseg; i++) {
+        const int base0 = b->seqs[sg[i].seq].len, chunk = win_chunk(base0);
+        need = std::max(need, (base0 + sg[i].rows + chunk - 1) / chunk);
+    }
+    while ((1 << lg) < need && lg < 5) lg++;
+    return lg;
+}
+
 // Run one block: a segment of rows for each of nseg distinct sequences. A record block (verify windows, up to
 // VERIFY_MAX rows a segment) can be cut back per sequence by keep; any other block is a single segment. Returns 0
 // on success.
@@ -739,9 +742,7 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
     for (int i = 0; i < npatch; i++)
         CK(cudaMemcpyAsync(b->xemb + (size_t)patches[i].row * HID, patches[i].src, (size_t)patches[i].n * HID * 2, cudaMemcpyDeviceToDevice, b->s0));
     const int bucket = bucket_of(nseg);
-    int maxlen = 0;
-    for (int i = 0; i < nseg; i++) maxlen = std::max(maxlen, b->seqs[sg[i].seq].len + sg[i].rows);
-    const int split_log = record ? split_log_of(maxlen, BUCKET_SEGS[bucket]) : 0;
+    const int split_log = record ? split_log_of(sg, nseg, b) : 0;
     // Shared blocks come in many sizes: round the rows up so a handful of captured graphs serve them all. The extra rows
     // are embedded from token 0 and touch no sequence's state (the kernels stop at ctl->nrows).
     const int real_rows = T;

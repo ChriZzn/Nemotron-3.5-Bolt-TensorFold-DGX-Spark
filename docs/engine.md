@@ -45,14 +45,16 @@ recurrent state. Extra jobs beyond N queue.
 
 ## libbolt (`engine/`)
 
-- `bolt_host.cu`: loading, the block forward, the C API, sequences, snapshots, calibration. A *block* is a list of
+- `bolt_host.cu`: loading, the block forward, the C API (`bolt_abi` is its version, which the backend checks at load;
+  `bolt_prefill_seq_rows` takes image rows by device pointer), sequences, snapshots, calibration. A *block* is a list of
   segments, each a run of rows of one sequence (a prompt chunk is one segment; a shared decode round has one verify
   window per stream). `Ctl` carries what changes between replays: tokens, and per segment its first row, cache length,
   sequence and state slots. A block of up to 1024 rows (128 for a shared round) is one launch sequence, captured into
   a CUDA graph the second time a shape repeats; shared rounds are padded to a few row counts (multiples of 8, then 16)
   so a handful of graphs serve them. The shared expert and the latent projection run on side streams.
 - `bolt_mma.cu`: tensor-core GEMMs for NVFP4, Q8_0, bf16 and IQ2_XXS from 16-row tiles (layouts in the file header);
-  `mma_big_k` stages activations in shared memory for blocks over 32 rows. Prompt attention and verify-window
+  `mma_big_k` stages activations in shared memory for prompt blocks over 32 rows, while decode and verify blocks
+  (`mma_decode_rows`) use the K-split kernel at any row count, 64 tokens a CTA. Prompt attention and verify-window
   attention on bf16 mma with online softmax (`attn_mma_part_k`; for windows one CTA is one stream's window).
 - `bolt_kernels.cu`: norms, the Mamba conv and scan (a row-parallel conv and a thread-pair scan for long blocks, a
   warp-per-channel scan for windows), the router, the routed experts on int8 tensor cores, candidate selection.
@@ -96,7 +98,9 @@ SSM state in and out (40 layers × 4 MiB × 2 × 16 = 5.4 GB), about 130 distinc
 weights (2.8 GB). That is the 85 ms the profile shows (`BOLT_PROF=1`), and about 80 % of
 the GB10's practical bandwidth. More rows per stream (draft depth) cost the extra experts they touch but no more state,
 which is why TensorFold's cost rule asks for longer windows when streams are few. Measured shared rounds, ms by total
-rows over 16 sequences: 16 → 61, 32 → 96, 64 → 141, 128 → 197.
+rows over 16 sequences, before the fixed summation order below: 16 → 61, 32 → 96, 64 → 141, 128 → 197. With it, 16
+streams of 4-row windows (64 rows) take 141.7 ms and 16 streams of 8-row windows (128 rows) 220.3 ms; 8 streams of
+8-row windows (64 rows) 130.4 ms against 135.5 before.
 
 ## Checks
 
@@ -104,11 +108,33 @@ The engine is checked against references that live in the development harness, n
 tensor-core GEMM and attention unit tests (attention includes several windows in one launch), and engine-level gates:
 perplexity 5.284 on the first 1,499 tokens of this README (5.288 through 8-row windows), a window cut to `n` rows equal
 to a window of `n` rows bit for bit, a resumed snapshot equal to a whole prefill, the drafter accepting 4.3 of 7 tokens
-on the model's own text, sixteen sequences decoded in one block each equal to its solo run, and a sequence's logits
-bit-identical whatever its neighbours hold. `BOLT_PROF=1` times each stage of a round.
+on the model's own text, sixteen sequences decoded in one block each equal to its solo run (768 of 768 tokens, plain
+steps and 4-row windows alike), and a sequence's logits bit-identical whatever its neighbours hold. `BOLT_PROF=1` times
+each stage of a round.
 
-Kernel choice follows the row count, so logits differ in the second decimal between a stream decoded alone and the
-same stream in a block of 64 rows (|logit| around 50); neighbours never matter.
+**Rounding does not depend on the batch.** Three things used to make a stream round differently among other streams
+than alone, and each is now fixed by the stream's own state alone:
+
+1. *Attention key chunks.* A verify window's attention merges partial softmaxes over chunks of keys. The chunk size is
+   `win_chunk(base)`: 128 keys, doubled until 32 chunks reach the sequence's end and its window, so it follows the
+   sequence's length and nothing else (the launch merely has room for the most any sequence needs, and unused chunks
+   contribute exact zeros). Before, the chunks followed the number of streams in the block (about 32 splits for one
+   stream, 8 for four) and the window's width.
+2. *GEMM summation order.* Blocks of more than 32 rows used `mma_big_k`, which walks K in one sequence, while the
+   K-split kernel sums four interleaved partials; the two round differently. Decode and verify blocks now always use
+   the K-split kernel (`mma_decode_rows`, 64 tokens a CTA, so the weights are decoded once per 64 tokens); only the
+   prompt pass keeps `mma_big_k`.
+3. *The plain step.* The non-speculative one-token step used the CUDA-core attention kernel. It now runs as a one-row
+   window (then kept), so drafted and plain decoding share the same arithmetic.
+
+Before this, a greedy reply followed a near tie the other way after some tokens whenever the batch differed (prose
+prompts at four streams all differed from their solo runs). Now perplexity of passages scored alone and in a block of
+2, 3, 4, 8 or 16 streams, with 8-row windows (up to 128 rows a block; also 1- and 5-row windows at four streams), is
+identical to five decimals;
+sixteen sequences match their solo runs for 768 of 768 tokens, plain steps and 4-row windows alike; and
+`bench_concurrent.py --alone --serial` finds concurrent replies equal to solo ones and drafted equal to
+`"draft": false`. The cost is in the widest rounds: 128 rows a round (16 streams of 8-row windows) take about 25 %
+longer (176.9 → 220.3 ms), while 64-row rounds are unchanged or faster.
 
 ## Checking a snapshot
 

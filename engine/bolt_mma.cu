@@ -416,6 +416,10 @@ __global__ void __launch_bounds__(128) mma_k(typename P::W w, const float* __res
     mma_body<P, NT, RT>(w, x + (size_t)g0 * ldx, ldx, y + (size_t)g0 * ldy, ldy, min(Tn - g0, NT * 8), epi, blockIdx.y * RT);
 }
 
+// Decode and verify blocks sum K in the K-split kernel's order at any row count, so a stream's rounding does not change
+// when other streams grow the block past 32 rows; the prompt pass keeps the faster large-block kernel.
+static bool g_decode_rows = false;
+
 template <class P>
 void launch_mma(cudaStream_t s, const typename P::W& w, const float* x, int ldx, float* y, int ldy, int T, int epi) {
     const int tiles = (w.n + 15) >> 4;
@@ -424,6 +428,7 @@ void launch_mma(cudaStream_t s, const typename P::W& w, const float* x, int ldx,
     if (T <= 8) mma_k<P, 1, RT><<<dim3(1, rg), 128, 0, s>>>(w, x, ldx, y, ldy, T, epi);
     else if (T <= 16) mma_k<P, 2, RT><<<dim3(1, rg), 128, 0, s>>>(w, x, ldx, y, ldy, T, epi);
     else if (T <= 32) mma_k<P, 4, RT><<<dim3(1, rg), 128, 0, s>>>(w, x, ldx, y, ldy, T, epi);
+    else if (g_decode_rows) mma_k<P, 8, RT><<<dim3((T + 63) / 64, rg), 128, 0, s>>>(w, x, ldx, y, ldy, T, epi);   // 64 tokens a CTA: the weights are decoded once per 64
     else {
         constexpr int BR = 2;                       // row tiles a warp owns
         const int rg2 = (tiles + 4 * BR - 1) / (4 * BR);
@@ -443,6 +448,7 @@ __global__ void __launch_bounds__(128) mma_q8_multi_k(TQ8Multi m, const float* _
 
 }  // namespace
 
+void mma_decode_rows(bool on) { g_decode_rows = on; }
 void mma_nv4(cudaStream_t s, const TNV4& w, const float* x, int ldx, float* y, int ldy, int T) { launch_mma<PNV4>(s, w, x, ldx, y, ldy, T, 0); }
 void mma_q8(cudaStream_t s, const TQ8& w, const float* x, int ldx, float* y, int ldy, int T) { launch_mma<PQ8>(s, w, x, ldx, y, ldy, T, 0); }
 void mma_bf16(cudaStream_t s, const TBF& w, const float* x, int ldx, float* y, int ldy, int T) { launch_mma<PBF>(s, w, x, ldx, y, ldy, T, 0); }
@@ -655,7 +661,7 @@ __global__ void __launch_bounds__(256) attn_mma_part_k(const Ctl* __restrict__ c
     const bool live = warp < nrow;
     const int len = live ? base0 + local + 1 : 0;
     const int maxlen = base0 + (MULTI ? nrow : min(T, qb * FA_Q + FA_Q));
-    int chunk = ((maxlen + splits - 1) / splits + 31) / 32 * 32;
+    const int chunk = MULTI ? win_chunk(base0) : ((maxlen + splits - 1) / splits + 31) / 32 * 32;
     const int p0 = sp * chunk, p1 = min(maxlen, p0 + chunk);
 
     // Q fragments: rows are the 16 heads of this KV head, k is the head dimension

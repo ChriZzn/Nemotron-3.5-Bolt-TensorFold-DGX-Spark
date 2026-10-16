@@ -83,7 +83,8 @@ In the order it matters:
 1. **Weights stay packed.** NVFP4 Mamba projections, Q8_0 attention and latent projections, IQ2_XXS experts. At
    batch one a token reads about 5 GB, not the 14.6 GB the fp16 expansion read. `bolt_mma.cu` repacks each matrix at
    load into 16-row tiles laid out so a lane fetches an `mma.m16n8k16` fragment with one 16-byte load; the dense
-   GEMMs run on tensor cores, with the activations staged in shared memory for prompt-sized blocks. NVFP4 block scales
+   GEMMs run on tensor cores; prompt blocks stage activations in shared memory, while decode and verify blocks sum K in one
+   fixed order whatever the row count. NVFP4 block scales
    are exact in fp16, so they are multiplied into the weights as they are decoded and the mma accumulates straight
    through K. Scales are applied to the fp32 accumulators, so only the activation (fp16, or bf16 for IQ2) is rounded.
 2. **A block of rows is one CUDA graph.** Embedding, 88 layers and the head replay as a graph; the shared expert and
@@ -101,7 +102,11 @@ In the order it matters:
 6. **Routed experts** are grouped by expert on the device and run on int8 tensor cores (activations quantized per 32,
    the IQ2 grid expanded to int8 in registers); hot experts are split into work items of 16 tokens.
 7. **Attention** is flash-style on bf16 tensor cores for prompts and for verify windows (one CTA per stream's window,
-   keys split across CTAs).
+   keys split across CTAs). A window splits a stream's keys into chunks fixed by the stream's own length (128 keys,
+   doubled until 32 chunks reach its end), never by the batch. With the GEMMs' fixed order (1), a stream's logits are
+   bit-identical alone, among other streams (tested up to 16 streams of 8-row windows) and in a window of any width; the
+   one-token step runs as a one-row window for the same reason, so drafted and plain decoding agree. The price is paid
+   in the widest rounds: 16 streams of 8-row windows (128 rows) take about 25 % longer; 64-row rounds are unchanged.
 8. **Memory follows use.** Every stream has the full 262,144-token window, but its attention rows are mapped from the
    GPU's virtual memory 4,096 tokens at a time and returned when it ends; only the 0.4 GiB of recurrent state per
    stream is held from load.

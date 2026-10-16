@@ -10,6 +10,15 @@ constexpr int LOGIT_ROWS = BATCH_MAX; // rows whose logits are kept (verify wind
 constexpr int SEG_MAX = 16;    // most sequences in one block
 constexpr int VERIFY_MAX = 8;  // most rows one sequence's verify window carries
 constexpr int CONV_SLOTS = VERIFY_MAX + 1;  // conv state slots a sequence keeps (one per window row, plus the start)
+
+// Keys one CTA of a verify window's attention covers: 128, doubled until 32 CTAs reach the end of the sequence and its
+// window. It depends on the sequence's own length alone, so a stream's rounding is the same alone, among other streams,
+// or in a wider window; the split of the keys is the only part of the forward whose order depended on the batch.
+__host__ __device__ inline int win_chunk(int base0) {
+    int k = 128;
+    while (k * 32 < base0 + VERIFY_MAX) k *= 2;
+    return k;
+}
 constexpr int HID = 4096;
 constexpr int VOCAB = 131072;
 constexpr int TOPN = 9;        // routed experts a token uses
@@ -64,6 +73,7 @@ void gemv_iq2(cudaStream_t s, const IQ2W& w, const float* x, int ldx, float* y, 
 void gemv_bf16(cudaStream_t s, const BF16W& w, const float* x, int ldx, float* y, int ldy, int T);
 
 // Tensor-core GEMMs for T rows (1..TMAX): x is [T][ldx] fp32, y is [T][ldy] fp32. epi 1: relu(v)^2.
+void mma_decode_rows(bool on);   // the GEMMs of the blocks enqueued next are decode or verify rows (summation order independent of the row count)
 void mma_nv4(cudaStream_t s, const TNV4& w, const float* x, int ldx, float* y, int ldy, int T);
 void mma_q8(cudaStream_t s, const TQ8& w, const float* x, int ldx, float* y, int ldy, int T);
 void mma_bf16(cudaStream_t s, const TBF& w, const float* x, int ldx, float* y, int ldy, int T);
