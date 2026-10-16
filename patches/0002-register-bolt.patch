@@ -160,3 +160,83 @@ index 48039508..248c4548 100644
  }
  
  /// generation_config.json's sampling (``do_sample`` false is greedy), then the serve flags over it.
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 381c864a..ecba18bf 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -46,6 +46,7 @@ test {
+     _ = @import("image_key.zig");
+     _ = @import("media_fetch.zig");
+     _ = @import("videos.zig");
++    _ = @import("vocab.zig");
+     _ = @import("stream_preflight_test.zig");
+     _ = @import("stream_dsml_test.zig");
+     _ = @import("logprobs_test.zig");
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 54065817..b0d11b4e 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -23,6 +23,7 @@ const live = @import("live.zig");
+ const slide_graph = @import("slide_graph.zig");
+ const slide_lesson = @import("slide_lesson.zig");
+ const cortheon = @import("cortheon/cortheon.zig");
++const vocab_size = @import("vocab.zig");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ const Allocator = std.mem.Allocator;
+@@ -229,7 +230,7 @@ pub const Server = struct {
+         return .{ .kind = kind, .text = text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .compiler = c };
+     }
+ 
+-    /// The model's grammar compiler: tokenizer.json, config.json's vocab_size (text_config first), the eos ids.
++    /// The model's grammar compiler: tokenizer.json, config.json's vocab_size (the text model's), the eos ids.
+     fn grammarCompiler(srv: *Server) ?*api.grammar.Compiler {
+         srv.grammar_mutex.lockUncancelable(srv.io);
+         defer srv.grammar_mutex.unlock(srv.io);
+@@ -244,10 +245,7 @@ pub const Server = struct {
+                 .ok => |v| v,
+                 .err => break :blk "config.json is not JSON",
+             };
+-            var vocab: ?u32 = null;
+-            for ([_]?json.Value{ cfg.get("text_config"), cfg }) |part| if (vocab == null) if (part) |p| if (p.get("vocab_size")) |v| if (v.int64()) |n| {
+-                vocab = @intCast(n);
+-            };
++            const vocab = vocab_size.size(cfg);
+             if (vocab == null) break :blk "structured output needs the checkpoint's config.json vocab_size";
+             var err: [512]u8 = undefined;
+             const c = a.create(api.grammar.Compiler) catch break :blk "out of memory";
+diff --git a/zig/src/server/vocab.zig b/zig/src/server/vocab.zig
+new file mode 100644
+index 00000000..d5db492d
+--- /dev/null
++++ b/zig/src/server/vocab.zig
+@@ -0,0 +1,29 @@
++//! The vocabulary size a checkpoint declares, for the token masks of structured output.
++const std = @import("std");
++const json = @import("json");
++
++/// config.json's vocab_size: the text model's (text_config, or an omni checkpoint's llm_config) before the top level's.
++pub fn size(cfg: json.Value) ?u32 {
++    for ([_]?json.Value{ cfg.get("text_config"), cfg.get("llm_config"), cfg }) |part| if (part) |p| if (p.get("vocab_size")) |v| if (v.int64()) |n| {
++        if (n > 0 and n <= std.math.maxInt(u32)) return @intCast(n);
++    };
++    return null;
++}
++
++fn parse(a: std.mem.Allocator, text: []const u8) !json.Value {
++    return switch (try json.parse(a, text)) {
++        .ok => |v| v,
++        .err => error.TestUnexpectedResult,
++    };
++}
++
++test "the vocabulary is the text model's: text_config, llm_config of an omni wrapper, else the top level" {
++    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    try std.testing.expectEqual(@as(?u32, 131072), size(try parse(a, "{\"model_type\": \"nemotron_h_omni\", \"llm_config\": {\"vocab_size\": 131072}}")));
++    try std.testing.expectEqual(@as(?u32, 151936), size(try parse(a, "{\"text_config\": {\"vocab_size\": 151936}, \"vocab_size\": 1}")));
++    try std.testing.expectEqual(@as(?u32, 32000), size(try parse(a, "{\"vocab_size\": 32000}")));
++    try std.testing.expectEqual(@as(?u32, null), size(try parse(a, "{\"llm_config\": {\"hidden_size\": 4096}}")));
++    try std.testing.expectEqual(@as(?u32, null), size(try parse(a, "{\"vocab_size\": 0}")));
++}

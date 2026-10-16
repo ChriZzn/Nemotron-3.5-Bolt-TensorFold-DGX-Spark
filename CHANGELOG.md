@@ -9,6 +9,28 @@ The Bolt backend serves the checkpoint. Measured on one GB10: decode 4.3 tok/s t
 LiLiCorr, greedy chat or code), 55 to 60 sampled; prefill 4.5 tok/s to 1,300 to 1,470 (from 1k to 50k tokens);
 sixteen streams at once, 167 tok/s aggregate sampled and 172 greedy.
 
+### Structured output and forced tool calls
+
+`response_format` (`json_schema`, `json_object`), the `guided_*` fields and `tool_choice` `"required"` or a named function
+were refused with HTTP 400 ("not supported by this engine yet"). Four causes, four fixes:
+
+- **No masked draws in the backend**, so the engine advertised no structured output. `verify` now redraws the rows of a
+  masked window among the tokens their bits allow, `first_masked` redraws the first token under the first mask, and
+  `held()` hands the grammar the drafts the drafter holds. libbolt gained `bolt_mask_rows` (C ABI version 2): a masked
+  variant of the two-stage GPU top-k that recomputes only the masked rows. Its kernel test against a CPU reference covers
+  masks of 5 tokens, about half the vocabulary and 1 token.
+- **The server could not read an omni checkpoint's vocabulary size** (`vocab_size` is in `llm_config`, not `text_config`
+  or the top level): `server/vocab.zig`, in patch 0002, with a test.
+- **`libtfgrammar` (xgrammar v0.2.8) was not in the image.** The Dockerfile builds it with upstream's `zig build grammar`
+  and installs it beside the server.
+- The libbolt binding moved to `engine/bolt_api.zig` so `bolt_native.zig` stays under the 600-line limit upstream asks
+  for; the Dockerfile copies both files.
+
+Measured on a dev server: `json_schema`, `json_object`, `tool_choice: required` and a forced named tool all returned valid
+output; 6 of 6 replies sampled at temperature 1 were valid; a streamed structured reply was valid JSON; with 4 structured
+and 4 plain requests running together, all 4 structured replies were valid and all 4 plain replies equalled their solo
+runs. A structured reply decoded at 130.9 tok/s alone against 90.2 for the same task unconstrained.
+
 ### Review fixes for video
 
 - User text that spells the video token (`<SPECIAL_30>`) or `<video>` stays text: it no longer turns a text-only request

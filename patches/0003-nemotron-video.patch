@@ -887,7 +887,7 @@ index 48e058b0..e986dd71 100644
  }
  
 diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
-index 381c864a..28956211 100644
+index ecba18bf..8440c894 100644
 --- a/zig/src/server/root.zig
 +++ b/zig/src/server/root.zig
 @@ -43,6 +43,7 @@ test {

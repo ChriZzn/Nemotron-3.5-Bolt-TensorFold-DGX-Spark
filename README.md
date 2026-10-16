@@ -35,7 +35,7 @@ TensorFold commit.
 
 TensorFold's Nemotron family serves Lightning 30B-A3B; this checkpoint is `nemotron_h_puzzle` (hidden 4096, 88
 blocks, per-layer expert counts, IQ2_XXS experts). `patches/0002-register-bolt.patch` registers a Bolt backend,
-`engine/bolt_native.zig`, in the native CUDA host, as the family `nemotron_h_puzzle`. The backend is a TensorFold *lane backend*: the HTTP server, chat
+`engine/bolt_native.zig` (with its libbolt binding, `engine/bolt_api.zig`), in the native CUDA host, as the family `nemotron_h_puzzle`. The backend is a TensorFold *lane backend*: the HTTP server, chat
 template, thinking budget, round loop, stop handling and keyed sampler are TensorFold's own. The forward pass lives in
 `libbolt.so` (`engine/*.cu`), loaded with `dlopen`, because the native kernels only cover Lightning's shapes.
 `./start.sh` checks the snapshot against [`contract/bolt.json`](contract/bolt.json) and serves it.
@@ -325,23 +325,45 @@ one message and in earlier turns of a conversation.
   requests are unchanged.
 - Memory: the tower and projector are 1.7 GB, plus the tower's scratch and a 134 MB rows buffer.
 
+### Structured output and tool calls
+
+`response_format` (`json_schema` or `json_object`), the `guided_*` fields and `tool_choice` `"required"` or a named
+function work as in the OpenAI API; the reply follows the grammar even when sampled, and streams as usual:
+
+```bash
+curl -s localhost:8888/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "Nemotron-3.5-Bolt", "max_tokens": 200, "chat_template_kwargs": {"enable_thinking": false},
+  "messages": [{"role": "user", "content": "Give a person named Ann aged 30 with two tags."}],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "person", "strict": true, "schema": {
+    "type": "object", "required": ["name", "age", "tags"], "additionalProperties": false,
+    "properties": {"name": {"type": "string"}, "age": {"type": "integer"},
+                   "tags": {"type": "array", "items": {"type": "string"}}}}}}}'
+```
+
+`"tool_choice": "required"` makes the model call one of the `tools`; `{"type": "function", "function": {"name": "get_time"}}`
+forces that one. The server compiles the grammar with `libtfgrammar` (xgrammar), which the image carries and loads at the
+first structured request; there is nothing to configure. A grammar-constrained reply decodes about as fast as a plain one
+(131 tok/s against 90 for the same JSON task unconstrained, since the grammar makes the drafts accurate).
+
 ### Thinking and sampling
 
 Thinking is on. Per request, `temperature`, `top_p` and `seed` override the defaults (`temperature: 0` is greedy).
 `"chat_template_kwargs": {"enable_thinking": false}` answers without thinking. The model card's medium effort is
 `{"enable_thinking": true, "medium_effort": true}`. Reasoning and the answer share `max_tokens`.
 
-Not served by this backend: logprobs, grammar-constrained decoding, speculative trees, int8/int4 KV caches (`fp8` and
-`bf16` only), WebP, GIF and BMP pictures.
+Not served by this backend: logprobs, speculative trees, int8/int4 KV caches (`fp8` and `bf16` only), WebP, GIF and
+BMP pictures.
 
 ## What the patches and the engine are
 
 - `patches/0001-vision-image-tokens.patch`: `--vision-image-tokens` up to 262,144 (it stopped at 16,384).
 - `patches/0002-register-bolt.patch`: the family `nemotron_h_puzzle` (an omni config around a puzzle text model reads as
-  that type), its registration in the CUDA host, prompt-cache rules without lookahead, and `zig build bolt` for libbolt.
+  that type), its registration in the CUDA host, prompt-cache rules without lookahead, `zig build bolt` for libbolt, and
+  structured output's server side (`server/vocab.zig`: an omni checkpoint's `vocab_size` sits in `llm_config`).
 - `patches/0003-nemotron-video.patch`: video through the RADIO tower (tubelets, the processor's frame labels), the
   template's `<video>` turned into one token before encoding, `--vision-max-videos`.
-- `engine/bolt_native.zig` (copied into the family at build time) is the lane backend; `engine/*.cu` builds
+- `engine/bolt_native.zig` and `engine/bolt_api.zig` (its libbolt binding; both copied into the family at build time) are
+  the lane backend; `engine/*.cu` builds
   `libbolt.so` (`zig build bolt -Dbolt-src=engine`, linked with `-lcuda` for the virtual-memory calls). [`docs/engine.md`](docs/engine.md) has the
   interface and the memory layout.
 
@@ -364,7 +386,7 @@ start.sh      prepare, check, launch
 stop.sh       stop a launch
 scripts/      prepare.sh, config.sh, publish-image.sh, banner.sh, ckptcheck.py (+ its test)
 patches/      the Bolt gate and registration, and image/video input, applied onto TensorFold at TF_REF
-engine/       bolt_native.zig (lane backend) and the CUDA sources of libbolt.so
+engine/       bolt_native.zig and bolt_api.zig (lane backend and its libbolt binding), the CUDA sources of libbolt.so
 contract/     bolt.json, the pinned checkpoint's schedule and quant groups
 docs/         engine.md, the backend and the engine
 .github/      issue and pull request templates, GitHub Sponsors

@@ -40,6 +40,12 @@ FFmpeg 9.0.2
   LGPL 2.1 or later. Built in the image from the release tarball with only the H.264, HEVC, VP8, VP9 and MPEG-4 decoders and
   the MP4 and Matroska demuxers, statically linked into libtfvideo.so (TensorFold's tools/zig/build_ffmpeg.sh).
 
+xgrammar v0.2.8, picojson, dlpack
+  https://github.com/mlc-ai/xgrammar, https://github.com/kazuho/picojson, https://github.com/dmlc/dlpack
+  Apache License 2.0 (xgrammar, dlpack) and BSD-2-Clause (picojson; its text is the header of picojson.h). Built in the image
+  as libtfgrammar.so by TensorFold's `zig build grammar`; xgrammar's NOTICE and the Apache texts are in
+  /opt/tensorfold/share/doc/tensorfold/.
+
 Zig
   https://ziglang.org
   Zig 0.17.0, used to compile tensorfold-native inside the image.

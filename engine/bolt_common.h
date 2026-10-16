@@ -132,6 +132,10 @@ void k_attn(cudaStream_t s, const Ctl* ctl, const float* q, const KvView& kv, fl
             int T, int splits, int multi, int nseg_unused = 0);
 // Row-wise top candidates of the logits: vals/ids are [T][CAND] sorted descending (ties to the lower id).
 void k_candidates(cudaStream_t s, const float* logits, int T, int topk, float* vals, int* ids, float* scratch_v, int* scratch_i);
+// The same for the n rows sel[i] among the tokens allowed by masks + i * words (structured output); a candidate list shorter
+// than topk (fewer allowed tokens) ends in entries of value -3.4e38.
+void k_candidates_masked(cudaStream_t s, const float* logits, const int* sel, const uint32_t* masks, int words, int n, int topk,
+                         float* vals, int* ids, float* scratch_v, int* scratch_i);
 
 // Draft-side kernels reuse the same primitives; see bolt_draft.cu.
 

@@ -392,6 +392,10 @@ struct Bolt {
     int *cids = nullptr, *csi = nullptr;
     std::vector<float> cvals_h;
     std::vector<int> cids_h;
+    int* msel = nullptr;                  // structured output: the rows to redraw, their masks, and the candidates found
+    uint32_t* mmask = nullptr;
+    float* mvals = nullptr;
+    int* mids = nullptr;
 
     Ctl* ctl_d = nullptr;
     Ctl* ctl_h = nullptr;
@@ -950,6 +954,10 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     CK(cudaMalloc(&b->xq_p, (size_t)TMAX * TOPN * 2560)); CK(cudaMalloc(&b->xs_p, (size_t)TMAX * TOPN * 80 * 4));
     CK(cudaMalloc(&b->cids, (size_t)LOGIT_ROWS * CAND * 4));
     CK(cudaMalloc(&b->csi, (size_t)LOGIT_ROWS * 128 * CAND * 4));
+    CK(cudaMalloc(&b->msel, (size_t)LOGIT_ROWS * 4));
+    CK(cudaMalloc(&b->mmask, (size_t)LOGIT_ROWS * (VOCAB / 32) * 4));
+    CK(cudaMalloc(&b->mvals, (size_t)LOGIT_ROWS * CAND * 4));
+    CK(cudaMalloc(&b->mids, (size_t)LOGIT_ROWS * CAND * 4));
     b->cvals_h.assign((size_t)LOGIT_ROWS * CAND, 0.f);
     b->cids_h.assign((size_t)LOGIT_ROWS * CAND, 0);
     CK(cudaMalloc(&b->ctl_d, sizeof(Ctl)));
@@ -996,7 +1004,7 @@ extern "C" Bolt* bolt_load(const char* dir) {
 
 
 // The C ABI version bolt_native.zig checks at load: bump it with any change to the calls below.
-extern "C" int bolt_abi() { return 1; }
+extern "C" int bolt_abi() { return 2; }
 
 extern "C" int bolt_seqs(Bolt* b) { return b->nseq; }
 extern "C" int bolt_context(Bolt* b) { return b->context; }
@@ -1090,6 +1098,27 @@ extern "C" int bolt_forward_multi(Bolt* b, int nseg, const int* seqs, const int*
         at += rows[i];
     }
     return run_blocks(b, sg, nseg, 1, cand_k);
+}
+
+// Structured output: redraw n rows of the last forward among the tokens their masks allow (row rows[i] reads masks + i * words,
+// bit t set = token t allowed) and replace those rows' candidates. A row with fewer than k allowed tokens ends in -3.4e38 values.
+extern "C" int bolt_mask_rows(Bolt* b, int n, const int* rows, const uint32_t* masks, int words, int k) {
+    if (n < 1 || n > LOGIT_ROWS || words < 1 || words > VOCAB / 32 || k < 1) return -1;
+    if (k > CAND) k = CAND;
+    for (int i = 0; i < n; i++) if (rows[i] < 0 || rows[i] >= LOGIT_ROWS) return -2;
+    CK(cudaMemcpyAsync(b->msel, rows, (size_t)n * 4, cudaMemcpyHostToDevice, b->s0));
+    CK(cudaMemcpyAsync(b->mmask, masks, (size_t)n * words * 4, cudaMemcpyHostToDevice, b->s0));
+    k_candidates_masked(b->s0, b->logits, b->msel, b->mmask, words, n, k, b->mvals, b->mids, b->csv, b->csi);
+    std::vector<float> v((size_t)n * CAND);
+    std::vector<int> id((size_t)n * CAND);
+    CK(cudaMemcpyAsync(v.data(), b->mvals, v.size() * 4, cudaMemcpyDeviceToHost, b->s0));
+    CK(cudaMemcpyAsync(id.data(), b->mids, id.size() * 4, cudaMemcpyDeviceToHost, b->s0));
+    CK(cudaStreamSynchronize(b->s0));
+    for (int i = 0; i < n; i++) {
+        memcpy(&b->cvals_h[(size_t)rows[i] * CAND], &v[(size_t)i * CAND], (size_t)k * 4);
+        memcpy(&b->cids_h[(size_t)rows[i] * CAND], &id[(size_t)i * CAND], (size_t)k * 4);
+    }
+    return 0;
 }
 
 // Candidates of a row of the last forward, best first.

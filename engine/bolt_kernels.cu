@@ -1257,6 +1257,58 @@ __global__ void __launch_bounds__(256) cand2_k(int topk, const float* __restrict
     }
 }
 
+// The same for chosen rows among only the tokens a structured-output mask allows (bit t of a row's `words` u32s): stage one
+// of row sel[i] reads its mask from masks + i * words, a disallowed token counting as -infinity.
+__global__ void __launch_bounds__(256) cand1m_k(const float* __restrict__ logits, const int* __restrict__ sel, const uint32_t* __restrict__ masks,
+                                                 int words, int topk, float* __restrict__ sv, int* __restrict__ si) {
+    const int i = blockIdx.y, b = blockIdx.x;
+    const float* row = logits + (size_t)sel[i] * VOCAB + (size_t)b * 1024;
+    const uint32_t* mk = masks + (size_t)i * words;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; j++) {
+        const int tok = b * 1024 + threadIdx.x + 256 * j;
+        const bool ok = (tok >> 5) < words && ((mk[tok >> 5] >> (tok & 31)) & 1u);
+        v[j] = ok ? row[threadIdx.x + 256 * j] : -3.4e38f;
+    }
+    __shared__ float wv[2][8];
+    __shared__ int wi[2][8];
+    for (int r = 0; r < topk; r++) {
+        float bv = -3.4e38f;
+        int bj = 0;
+#pragma unroll
+        for (int j = 0; j < 4; j++) if (v[j] > bv) { bv = v[j]; bj = j; }
+        int bi = threadIdx.x + 256 * bj;
+#pragma unroll
+        for (int m = 16; m > 0; m >>= 1) {
+            float ov = __shfl_xor_sync(0xffffffffu, bv, m);
+            int oi = __shfl_xor_sync(0xffffffffu, bi, m);
+            if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+        }
+        int slot = r & 1;
+        if ((threadIdx.x & 31) == 0) { wv[slot][threadIdx.x >> 5] = bv; wi[slot][threadIdx.x >> 5] = bi; }
+        __syncthreads();
+        float fv = wv[slot][0];
+        int fi = wi[slot][0];
+#pragma unroll
+        for (int w = 1; w < 8; w++) if (better(wv[slot][w], wi[slot][w], fv, fi)) { fv = wv[slot][w]; fi = wi[slot][w]; }
+        if (threadIdx.x == 0) {
+            size_t o = ((size_t)i * CAND_BLOCKS + b) * CAND + r;
+            sv[o] = fv;
+            si[o] = b * 1024 + fi;
+        }
+        if ((fi & 255) == threadIdx.x) v[fi >> 8] = -3.4e38f;
+    }
+}
+
+void k_candidates_masked(cudaStream_t s, const float* logits, const int* sel, const uint32_t* masks, int words, int n, int topk,
+                         float* vals, int* ids, float* sv, int* si) {
+    if (topk < 1) topk = 1;
+    if (topk > CAND) topk = CAND;
+    cand1m_k<<<dim3(CAND_BLOCKS, n), 256, 0, s>>>(logits, sel, masks, words, topk, sv, si);
+    cand2_k<<<n, 256, 0, s>>>(topk, sv, si, vals, ids);
+}
+
 void k_candidates(cudaStream_t s, const float* logits, int T, int topk, float* vals, int* ids, float* sv, int* si) {
     if (topk < 1) topk = 1;
     if (topk > CAND) topk = CAND;
