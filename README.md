@@ -43,27 +43,25 @@ template, thinking budget, round loop, stop handling and keyed sampler are Tenso
 ## Speed
 
 Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) against the running server (`Nemotron-3.5-Bolt`).
-"×N" is N clients at once; TTFT is the time to the first token.
+"×N" is N clients at once; TTFT is the time to the first token. The decode tables are from the current build; the prefill table is from an earlier run (the prompt path has not changed since).
 
 Decode, prose prompts:
 
 | clients | aggregate | each stream | TTFT |
 | ---: | ---: | ---: | ---: |
-| ×1 | 65.8 tok/s | 65.8 tok/s | 62 ms |
-| ×2 | 97.0 tok/s | 49.6 tok/s | 117 ms |
-| ×4 | 131.2 tok/s | 35.0 tok/s | 219 ms |
-| ×8 | 176.1 tok/s | 24.2 tok/s | 487 ms |
-| ×16 | 171.2 tok/s | 23.2 tok/s | 6.20 s |
+| ×1 | 71.0 tok/s | 71.0 tok/s | 56 ms |
+| ×2 | 91.5 tok/s | 47.3 tok/s | 297 ms |
+| ×4 | 126.8 tok/s | 35.2 tok/s | 575 ms |
+| ×8 | 166.6 tok/s | 23.5 tok/s | 1.23 s |
 
 Decode, code prompts:
 
 | clients | aggregate | each stream | TTFT |
 | ---: | ---: | ---: | ---: |
-| ×1 | 119.5 tok/s | 119.5 tok/s | 65 ms |
-| ×2 | 159.4 tok/s | 81.5 tok/s | 107 ms |
-| ×4 | 210.9 tok/s | 58.0 tok/s | 229 ms |
-| ×8 | 278.4 tok/s | 38.4 tok/s | 597 ms |
-| ×16 | 267.7 tok/s | 36.0 tok/s | 8.05 s |
+| ×1 | 114.1 tok/s | 114.1 tok/s | 55 ms |
+| ×2 | 160.9 tok/s | 83.3 tok/s | 198 ms |
+| ×4 | 198.3 tok/s | 54.0 tok/s | 403 ms |
+| ×8 | 245.3 tok/s | 35.8 tok/s | 985 ms |
 
 Prefill, cold prompts of one request:
 
