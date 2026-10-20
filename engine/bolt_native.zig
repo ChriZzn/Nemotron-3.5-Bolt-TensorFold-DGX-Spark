@@ -313,16 +313,32 @@ const Engine = struct {
         }
     }
 
-    /// Roll each stream back to its window's kept rows.
+    /// Roll each stream back to its window's kept rows: every stream's cut in one call, so libbolt waits for the GPU once.
     fn keep(ptr: *anyopaque, windows: []const lanes.backend.Window, paths: []const []const u32) !void {
         const e: *Engine = @ptrCast(@alignCast(ptr));
         const t0 = nowMs();
-        for (windows, paths) |w, path| {
-            const slot = try e.slotOf(w.stream);
-            e.api.keep(e.model, slot.seq, @intCast(path.len));
-        }
+        var cuts: Cuts = .{};
+        for (windows, paths) |w, path| try cuts.add(e, (try e.slotOf(w.stream)).seq, @intCast(path.len));
+        cuts.flush(e);
         e.stat.keep += nowMs() - t0;
     }
+
+    /// Sequences to cut back and the rows each keeps, handed to libbolt together.
+    const Cuts = struct {
+        seqs: [max_segs]c_int = undefined,
+        rows: [max_segs]c_int = undefined,
+        n: usize = 0,
+        fn add(c: *Cuts, e: *Engine, seq: c_int, rows: c_int) !void {
+            if (c.n == max_segs) c.flush(e);
+            c.seqs[c.n] = seq;
+            c.rows[c.n] = rows;
+            c.n += 1;
+        }
+        fn flush(c: *Cuts, e: *Engine) void {
+            if (c.n > 0) e.api.keep_multi(e.model, @intCast(c.n), &c.seqs, &c.rows);
+            c.n = 0;
+        }
+    };
 
     /// Hold each stream's drafts for its next window: LiLiCorr over every stream's kept rows in one pass.
     fn draft(ptr: *anyopaque, requests: []const lanes.backend.DraftRequest) !void {
@@ -334,11 +350,16 @@ const Engine = struct {
         var who: [max_segs]*Slot = undefined;
         var depths: [max_segs]u32 = undefined;
         var n: usize = 0;
+        // a shared round drafts before it keeps: cut every stream back to its kept rows first (a repeat is a no-op)
+        var cuts: Cuts = .{};
         for (requests) |r| {
             const slot = try e.slotOf(r.stream);
             slot.held_n = 0;
-            // a shared round drafts before it keeps: cut the stream back to its kept rows first (a repeat is a no-op)
-            if (r.rows) |rows| e.api.keep(e.model, slot.seq, @intCast(rows.len));
+            if (r.rows) |rows| try cuts.add(e, slot.seq, @intCast(rows.len));
+        }
+        cuts.flush(e);
+        for (requests) |r| {
+            const slot = try e.slotOf(r.stream);
             if (!e.drafts or r.depth == 0 or n == max_segs) continue;
             const pending: u32 = if (r.follow.len > 0) r.follow[r.follow.len - 1] else switch (r.first orelse continue) {
                 .handle => |h| e.ring[h % draw_ring],
@@ -509,7 +530,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             .drafts = window - 1,
             .window_costs = &costs,
             .shared_costs = shared[0..n_shared],
-            .mtp_step_ms = propose_ms / 3.0,
+            // LiLiCorr proposes its seven drafts in one pass whatever depth a window takes, so a draft level costs
+            // nothing by itself: the pass is a flat cost a round, which the round loop measures as overhead (per
+            // stream count, so a wider batch's longer pass is priced too)
+            .mtp_step_ms = 0,
             .draft_streams = nseq > 1,
             .hidden_rows = nseq > 1,
             .streams_exact = true,
