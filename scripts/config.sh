@@ -80,6 +80,10 @@ SSM_LAZY="${SSM_LAZY:-1}"
 # same replies and the same speed within noise either way; Q8_0 keeps 200 MB of memory.
 # BOLT_CAL=spread (passed through when set) calibrates the planner's shared-round table the 1.0.12 way, by spread rows.
 DRAFT_Q8="${DRAFT_Q8:-1}"
+# 1 runs the prompt pass's NVFP4 projections (in_proj, out_proj) on the fp4 tensor cores with the rows quantized to NVFP4 as
+# vLLM's NVFP4 path does: prefill +17 to 20 %, perplexity +0.8 % on the harness (prose +1.2 %, code +0.4 %); the first
+# token of a prompt was unchanged in every test, later greedy tokens can differ. 0 keeps the fp16 rows (BOLT_NV4_FP4).
+NV4_FP4="${NV4_FP4:-1}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
 THINKING="${THINKING:-1}"
 # generation_config.json: temperature 1.0, top_p 0.95. TOP_K empty omits --top-k.

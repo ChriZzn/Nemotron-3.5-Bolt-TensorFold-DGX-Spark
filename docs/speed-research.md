@@ -400,3 +400,98 @@ version needs the state in registers (32 a lane in the B-fragment layout), doubl
 warp-parallel prefix and two CTAs an SM: a day's work for about 4 % of prefill, so it is parked as a reference.
 A four-threads-a-channel variant of the sequential kernel was 2.4× slower (exact): that kernel is bound by its
 per-step shared-memory broadcast reads of B and C, and doubling the warps a block doubles them.
+
+### Item 5: the NVFP4 projections on the block-scaled fp4 tensor cores (2026-10-20)
+
+GB10's `mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64 ... e2m1.e2m1.f32.ue4m3` takes both
+operands as e2m1 nibbles with an e4m3 scale a block of 16: exactly NVFP4. The weights keep their nibbles and
+block scales (`tile_nv4w_k` only reorders them into the MMA's fragment order: a lane's 16-byte piece is its A
+fragment as stored); the rows are quantized the same way at run time (`quant_nv4_rows_k`: scale = amax / 6 a
+block, rounded to e4m3, values to the nearest e2m1), which is what vLLM's NVFP4 path does with these
+checkpoints. `mma_nv4_fp4_k`: 128 rows × 128 tokens a CTA, 64 k a step, `cp.async` rings for the
+weight pieces, their scales, the rows and their scales; no dequantization anywhere. The recipe's libbolt build
+targets `sm_121a` now (the block-scaled MMA is refused on plain `sm_121`). Checked exact against a CPU reference
+computed from the same quantized inputs (`gemm_bench.cu ... fp4`); 133 TFLOPS on `in_proj` (2.15× the fp16
+path) and 98 on `out_proj` (1.68×). The difference to the fp16 path is 9.5 % rms, the fp4 rows themselves.
+
+End to end (`BOLT_NV4_FP4=1`, prompt chunks only): prefill 1,913 → 2,330 tok/s at 2.7k tokens, 2,027 → 2,425
+at 5.3k, 1,944 → 2,314 at 21k, 1,768 → 2,078 at 42k (**+17 to 20 %**). The first token's hash is unchanged at
+every size, but a 200-token greedy continuation after a 22.5k-token document diverges after 76 characters, so
+this is a real numerics change and the perplexity harness (`engine/tools/ppl.cu`, through libbolt's C ABI on a
+22k-token prose and a 22k-token code sequence) decides it.
+
+Perplexity (`ppl.cu`, 22,473 prose tokens from this repo's docs and 22,159 code tokens from `bolt_kernels.cu`,
+blocks of 128 rows, run with the test server stopped because the lazy KV mapping refuses to grow under the
+memory reserve):
+
+| path | prose | code | all |
+| --- | ---: | ---: | ---: |
+| decode-path kernels (bf16 shared expert) | 5.6280 | 1.6293 | 3.0413 |
+| prompt-path kernels (int8 shared expert, routed tile) | 5.6287 | 1.6296 | 3.0418 |
+| prompt path + fp4 projections (`BOLT_NV4_FP4`) | 5.6968 | 1.6353 | 3.0657 |
+| decode path + `BOLT_IQ2_WHOLE` + `BOLT_SHARED_DECODE` | 5.6287 | 1.6296 | 3.0418 |
+
+So the int8 rows of the shared expert cost 0.02 % and the fp4 rows of the two projections 0.8 % (prose 1.2 %,
+code 0.4 %), for +17 to 20 % prefill. `NV4_FP4=1` is the default with that number stated; `NV4_FP4=0` keeps the
+fp16 rows. The two parked decode switches are numerically free by this measure but were not faster end to end,
+so they stay off.
+
+### Tuning the fp4 kernel: 133 → 154 TFLOPS
+
+The shipped kernel sat at 133 TFLOPS on `in_proj` and 98 on `out_proj` of a measured 429 peak (`mma_peak.cu`,
+the block-scaled MMA alone). Each step below was measured on `gemm_bench.cu ... fp4` (2048 rows, best of
+five, exact against the CPU reference throughout):
+
+| change | `in_proj` TFLOPS | `out_proj` TFLOPS |
+| --- | ---: | ---: |
+| as shipped (three-stage ring, 32-byte token rows) | 133 | 98 |
+| token rows at a 48-byte stride (conflict-free B reads) | 137 | 101 |
+| B fragments through `ldmatrix` | 136 | 106 |
+| row scales step-major (`[k/64][T][4]`), 16-byte `cp.async` loads | 154 | 113 |
+| two steps of 64 k a barrier, two-stage ring | 154 | 118 |
+| 256-row CTA of 16 warps (one CTA an SM) | 142 | 111 |
+| 128-row CTA, one CTA an SM (136 registers) | 126 | 102 |
+
+The two losers are not kept. The kernel is at 126 registers with two CTAs an SM; what keeps it at 36 % of
+peak is the shared-memory traffic a step (each warp re-reads 16 token rows and 2 weight tiles for 32 MMAs) and
+the barrier a stage, the usual gap between `mma.sync` with manual staging and a `wgmma`/TMA pipeline, which
+GB10 does not have. End to end +2 %: 2,305 to 2,388 tok/s at 2.7k tokens, 2,469 at 5.3k, 2,360 at 21k, 2,115 at
+42k. The step-major scales first crashed prompt chunks whose row count was not a multiple of 4 (a 16-byte
+`cp.async` from a 4-byte-aligned address; `gemm_bench` had only run 2048 rows), so the stride is padded to 4 rows
+and the microbenchmarks now run odd row counts too. `engine/tools/fp4_cmp.cu` compares the tuned kernel with the
+shipped one (kept as `old_fp4.inc`) on rows spanning 16 binades: bit-identical on 118 million outputs at 2048,
+1440, 945, 601, 128, 7 and 1 rows, and the perplexity harness repeats 5.6968 / 1.6353 / 3.0657 exactly.
+
+### Prompt attention at long context: 29 → 62 TFLOPS, identical outputs
+
+`engine/tools/attn_bench.cu` runs the prompt attention (`attn_mma_part_k` + `attn_mma_comb_k`, splits 4) for a
+2048-row chunk against a bf16 cache of 8k, 40k and 128k earlier keys and checks the variants bit-exact against the
+shipped kernel and a few rows against a CPU softmax. The shipped kernel sits at **29 TFLOPS at every context
+length** (of the 107 fp16 `mma.sync` peak), so it is instruction-bound, not memory-bound: it stages K and V
+through registers with 2-byte stores for the V transpose, builds every B fragment from 4-byte shared-memory
+loads, and takes two barriers a 32-key tile. At 40k context the eight attention layers cost 8 × 50 ms a chunk,
+about 40 % of the chunk; at 128k, 8 × 153 ms, which is why prefill fell to 987 tok/s there.
+
+`attn_mma2_part_k` (`BOLT_ATTN_V2`, default on, bf16 cache) keeps the per-warp math of the first kernel (one
+query row's 16 heads against 32 keys a softmax step, the same MMA order, so the outputs are **bit-identical**)
+and changes only how the operands arrive: K and V tiles come in by `cp.async` (zero-fill past the range) into a
+two-stage ring of 64 keys, V stays `[key][dim]` and is transposed by `ldmatrix.trans`, K fragments come from
+`ldmatrix`, one barrier pair a 64-key stage. 201 registers, one CTA an SM. The grid also puts the query block
+first so the CTAs resident at once walk the same key range (that alone was 12 % at 40k).
+
+| context | shipped | query block fastest | v2 64 keys × 2 stages | v2 32 × 3 | v2 32 × 4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8k | 10.4 ms, 30 TFLOPS | 10.6 | **6.1 ms, 51** | 6.0 | 6.1 |
+| 40k | 50.2 ms, 28 | 44.1 | **22.8 ms, 62** | 23.1 | 23.4 |
+| 128k | 153 ms, 28 | 148 | **68.1 ms, 64** | 69.1 | 69.9 |
+
+End to end (`BOLT_ATTN_V2=1`, now the default; the 42k to 126k rows measured against `BOLT_ATTN_V2=0` on the same
+build, the rest against the fp4-tuned build before it): 2.7k tokens 2,312 to 2,408 tok/s (level), 5.3k 2,493 to
+2,508 (+1 %), 21k 2,360 → 2,483 (+5 %), 42k 2,115 → 2,365 (+12 %), 63k 1,923 → 2,254 (+17 %), 126k 1,499 → 1,973
+(+32 %). First-token hashes at every size, the 22.5k-token continuation and the one- and sixteen-stream decode
+replies are unchanged (decode 137 code / 73 prose alone, 379 / 280 at sixteen streams).
+
+(64 keys × 3 stages and 128 × 2 need more than GB10's 99 KB of shared memory a CTA.) Forcing two CTAs an SM
+(128 registers) spills and is 15 % slower. What is left in it: the online softmax's rescale of 64 accumulators
+and 18 `exp`s a 32-key step per warp are about as many issue slots as the 64 MMAs, with only eight warps an SM
+to overlap them; a 64-key softmax step or FA3-style lazy rescaling would help but changes the rounding.

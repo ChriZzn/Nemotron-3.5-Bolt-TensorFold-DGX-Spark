@@ -23,7 +23,7 @@ index 00000000..f56d6246
 +        return;
 +    };
 +    const root: std.Build.LazyPath = .{ .cwd_relative = dir };
-+    const run = b.addSystemCommand(&.{ tool, "-shared", "-Xcompiler", "-fPIC", "-O3", "-gencode", "arch=compute_121,code=sm_121", "-I" });
++    const run = b.addSystemCommand(&.{ tool, "-shared", "-Xcompiler", "-fPIC", "-O3", "-gencode", "arch=compute_121a,code=sm_121a", "-I" });
 +    run.addDirectoryArg(root);
 +    run.addArg("-o");
 +    const lib = run.addOutputFileArg("libbolt.so");

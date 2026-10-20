@@ -41,6 +41,9 @@ struct IQ2Slab { const uint8_t* qs; const void* d; size_t qs_stride, d_stride; }
 // reads the A fragments of m16n8k16 with one 16-byte load. n and k are the logical sizes; the tile count is
 // ceil(n / 16) and missing rows are zero. See bolt_mma.cu for the exact byte layouts.
 struct TNV4 { const uint4* q; const uint2* sc; float s2; int n, k; };   // NVFP4
+// NVFP4 in the fragment order of the block-scaled fp4 MMA (m16n8k64, kind::mxf4nvf4): per 16-row tile and 64-k step,
+// lane l holds 4 words (rows g, g+8 at k 8t.. and 32+8t..), and 16 scale words (4 e4m3 bytes a row, one a k-block of 16)
+struct TNV4W { const uint4* q; const uint32_t* sf; float s2; int n, k; };
 struct TQ8  { const uint4* q; const uint32_t* d; int n, k; };           // Q8_0
 struct TBF  { const uint4* w; int n, k; };                              // bf16
 struct TIQ2 { const uint4* q; const uint16_t* d; int n, k; };           // IQ2_XXS
@@ -107,9 +110,15 @@ inline void launch_pdl(void (*kern)(KArgs...), dim3 grid, dim3 block, size_t sme
 }
 
 void mma_decode_rows(bool on);
+void prompt_min_rows_set(int rows);   // rows from which the prompt-chunk GEMM kernels apply (256; the perplexity harness lowers it)
 // a scratch of `elems` halves for the GEMMs launched on stream `s` to pack their rows into (BOLT_PACK=0 leaves the rows fp32)
 void mma_pack_buffer(cudaStream_t s, uint16_t* buf, size_t elems);   // the GEMMs of the blocks enqueued next are decode or verify rows (summation order independent of the row count)
 void mma_nv4(cudaStream_t s, const TNV4& w, const float* x, int ldx, float* y, int ldy, int T);
+// BOLT_NV4_FP4: prompt chunks' NVFP4 projections on the block-scaled fp4 tensor cores, the rows quantized to NVFP4
+// (e2m1 with an e4m3 scale a block of 16) first; q4/sf are the scratch for them ([T][k/2] and [T][k/16] bytes)
+void tile_nv4w(cudaStream_t s, const uint8_t* q, const uint8_t* sc, void* qw, void* sfw, int n, int k);
+void quant_nv4_rows(cudaStream_t s, const float* x, int ldx, uint8_t* q4, uint8_t* sf, int T, int k);
+void mma_nv4_fp4(cudaStream_t s, const TNV4W& w, const uint8_t* q4, const uint8_t* sf, float* y, int ldy, int T);
 void mma_q8(cudaStream_t s, const TQ8& w, const float* x, int ldx, float* y, int ldy, int T);
 void mma_bf16(cudaStream_t s, const TBF& w, const float* x, int ldx, float* y, int ldy, int T);
 void mma_iq2(cudaStream_t s, const TIQ2& w, const float* x, int ldx, float* y, int ldy, int T, int epi = 0);

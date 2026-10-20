@@ -56,7 +56,10 @@ sets it), which sizes the recurrent state. Extra jobs beyond N queue.
 - `bolt_mma.cu`: tensor-core GEMMs for NVFP4, Q8_0, bf16 and IQ2_XXS from 16-row tiles (layouts in the file header);
   `mma_big_k` stages activations in shared memory for prompt blocks over 32 rows, while decode and verify blocks
   (`mma_decode_rows`) use the K-split kernel at any row count, 64 tokens a CTA. Prompt attention and verify-window
-  attention on bf16 mma with online softmax (`attn_mma_part_k`; for windows one CTA is one stream's window).
+  attention on bf16 mma with online softmax (`attn_mma2_part_k` for prompt chunks with the bf16 cache: `cp.async`
+  staging and `ldmatrix` fragments, `BOLT_ATTN_V2=0` for the first kernel; `attn_mma_part_k` for windows, one CTA a
+  stream's window, and the fp8 cache). The prompt pass's NVFP4 projections run on the block-scaled fp4 MMA
+  (`mma_nv4_fp4_k`, `BOLT_NV4_FP4`).
 - `bolt_kernels.cu`: norms, the Mamba conv and scan (a row-parallel conv and a thread-pair scan for long blocks, a
   warp-per-channel scan for windows), the router, the routed experts on int8 tensor cores, candidate selection.
 - `bolt_draft.cu`: the LiLiCorr drafter: five DFlash layers (grouped conv, sliding-window sink attention, NVFP4 MLP)
@@ -99,6 +102,10 @@ masked top-k with a CPU reference for a mask of 5 tokens, about half the vocabul
   own rows from it; a prompt chunk commits its final state as before, and a snapshot with rows pending folds them first
   (`k_scan_fold`). The default: measured on a Spark, replies are the same token for token and 4 to 16 streams decode 3 to 8 %
   more tokens a second (one stream the same). `BOLT_SSM_LAZY=0` keeps two copies.
+- **Prompt chunks' NVFP4 projections** (`NV4_FP4`, default 1): `in_proj` and `out_proj` run on the block-scaled fp4
+  MMA (`kind::mxf4nvf4`, m16n8k64, e4m3 scales a block of 16) with the rows quantized to NVFP4 first (`quant_nv4_rows_k`);
+  the weights are read as stored, reordered into the MMA's fragment order at load (`tile_nv4w_k`, a second copy). Verify
+  blocks keep the fp16 rows. Perplexity +0.8 % on `engine/tools/ppl.cu` for +17 to 20 % prefill; libbolt builds for `sm_121a`.
 - **Conv**: a ring of nine slots; a window writes the state after each row, `keep(n)` picks slot `n`.
 - **Attention K/V**: bf16, 8 KB a token; with `BOLT_KV=fp8` (`KV_DTYPE=fp8`) e4m3 bytes plus an fp32 scale per token and
   head (amax / 448, set when the row is stored), 4.1 KB a token. The kernels dequantize while staging tiles, so the

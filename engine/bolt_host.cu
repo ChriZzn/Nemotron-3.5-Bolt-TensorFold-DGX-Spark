@@ -42,6 +42,7 @@ struct Layer {
     float* norm = nullptr;
     // mamba
     TNV4 in_proj{}, out_proj{};
+    TNV4W in_projw{}, out_projw{};   // the same in the fp4 MMA's fragment order (BOLT_NV4_FP4)
     float *conv_w = nullptr, *conv_b = nullptr, *A_log = nullptr, *D = nullptr, *dt_bias = nullptr, *gnorm = nullptr;
     float* ssm = nullptr;   // [seq][2][SSM_ELEMS] (one slot a sequence with a lazy state)
     float *hist_x = nullptr, *hist_dt = nullptr;  // scan inputs of the last record block's rows [BATCH_MAX] (lazy: [seq][2][VERIFY_MAX])
@@ -217,6 +218,28 @@ TQ8 load_q8(Store* s, const std::string& name) {
     return m;
 }
 
+bool g_nv4_fp4 = false;   // BOLT_NV4_FP4: prompt chunks' NVFP4 projections on the fp4 tensor cores (rows quantized to NVFP4)
+TNV4W load_nv4w(Store* s, const std::string& name) {
+    TNV4W m{};
+    Info w; const uint8_t* data;
+    if (!lookup(s, name + ".weight", w, data) || w.shape.size() != 2) return m;
+    m.n = (int)w.shape[0]; m.k = (int)w.shape[1] * 2;
+    void* rq = dev_copy(data, w.len);
+    Info sc; const uint8_t* sd;
+    lookup(s, name + ".weight_scale", sc, sd);
+    void* rs = dev_copy(sd, sc.len);
+    Info g; const uint8_t* gd;
+    lookup(s, name + ".weight_scale_2", g, gd);
+    memcpy(&m.s2, gd, 4);
+    void *qw, *sfw;
+    CK(cudaMalloc(&qw, tile_bytes_nv4(m.n, m.k)));
+    CK(cudaMalloc(&sfw, tile_scale_bytes_nv4(m.n, m.k)));
+    tile_nv4w(0, (const uint8_t*)rq, (const uint8_t*)rs, qw, sfw, m.n, m.k);
+    CK(cudaDeviceSynchronize());
+    cudaFree(rq); cudaFree(rs);
+    m.q = (const uint4*)qw; m.sf = (const uint32_t*)sfw;
+    return m;
+}
 TNV4 load_nv4(Store* s, const std::string& name) {
     TNV4 m{};
     Info w; const uint8_t* data;
@@ -407,11 +430,13 @@ struct Bolt {
     float *glog = nullptr, *lat = nullptr, *lat2 = nullptr, *rw = nullptr, *act = nullptr, *mo = nullptr, *sact = nullptr;
     bool shared_tile = false;     // BOLT_SHARED_TILE: prompt chunks' shared expert on the int8 tile kernel
     bool shared_decode = false;   // BOLT_SHARED_DECODE: verify blocks' shared expert on the int8 deep-prefetch kernel too
+    int prompt_min_rows = 256;    // BOLT_PROMPT_MIN_ROWS: rows from which a block takes the prompt-chunk kernels (the perplexity harness lowers it)
     int8_t* xq_s = nullptr; float* xs_s = nullptr;   // its int8 rows (up to 5376 wide) and scales
     int *s_order = nullptr, *s_first = nullptr, *s_count = nullptr, *s_exp = nullptr, *s_nwork = nullptr;
     int *ridx = nullptr, *order = nullptr, *wfirst = nullptr, *wcount = nullptr, *wexp = nullptr, *nwork = nullptr;
     int* moe_stat = nullptr;      // BOLT_PROF: distinct experts and work items, summed over the MoE launches since the last report
     uint16_t* xpack[3] = {nullptr, nullptr, nullptr};   // the GEMMs' packed rows, one scratch a stream
+    uint8_t* xq4 = nullptr; uint8_t* xsf4 = nullptr;      // rows as NVFP4 for the fp4 projections (main stream only)
     int8_t *xq_t = nullptr, *xq_p = nullptr;   // int8 inputs of the expert kernels: per token (up) and per pair (down)
     float *xs_t = nullptr, *xs_p = nullptr;
     float* logits = nullptr;
@@ -608,14 +633,20 @@ void enqueue_block(Bolt* b, int T, int record, int cand_k, int last_only, int ns
         k_add_rms(s0, b->x, r1, r2, ly.norm, b->xn, cap, 6 * HID, b->eps, T);
         mark(b, "add_rms");
         if (ly.type == 0) {
-            if (!skip("inproj")) mma_nv4(s0, ly.in_proj, b->xn, HID, b->proj, PROJ, T);
+            if (!skip("inproj")) {
+                if (g_nv4_fp4 && !record && T >= b->prompt_min_rows) { quant_nv4_rows(s0, b->xn, HID, b->xq4, b->xsf4, T, HID); mma_nv4_fp4(s0, ly.in_projw, b->xq4, b->xsf4, b->proj, PROJ, T); }
+                else mma_nv4(s0, ly.in_proj, b->xn, HID, b->proj, PROJ, T);
+            }
             mark(b, "mamba.in_proj");
             k_conv(s0, ctl, ly.conv, ly.conv_w, ly.conv_b, b->proj, PROJ, b->xbc, T, record, record ? ly.hist_x : nullptr, record ? ly.hist_dt : nullptr, nseg, b->ssm_lazy);
             if (!skip("scan")) k_scan(s0, ctl, ly.ssm, b->xbc, b->proj, PROJ, ly.A_log, ly.dt_bias, ly.D, b->ybuf, T, record, nseg, b->ssm_lazy, ly.hist_x, ly.hist_dt);
             mark(b, "mamba.conv+scan");
             k_gate_rms(s0, b->ybuf, b->proj, PROJ, ly.gnorm, b->gout, b->eps, T);
             mark(b, "mamba.gate_rms");
-            if (!skip("outproj")) mma_nv4(s0, ly.out_proj, b->gout, 8192, b->r1, HID, T);
+            if (!skip("outproj")) {
+                if (g_nv4_fp4 && !record && T >= b->prompt_min_rows) { quant_nv4_rows(s0, b->gout, 8192, b->xq4, b->xsf4, T, 8192); mma_nv4_fp4(s0, ly.out_projw, b->xq4, b->xsf4, b->r1, HID, T); }
+                else mma_nv4(s0, ly.out_proj, b->gout, 8192, b->r1, HID, T);
+            }
             mark(b, "mamba.out_proj");
         } else if (ly.type == 2) {
             TQ8Multi m{};
@@ -639,7 +670,7 @@ void enqueue_block(Bolt* b, int T, int record, int cand_k, int last_only, int ns
             CK(cudaStreamWaitEvent(s2, b->ev_fork));
             // shared expert
             if (!skip("shared")) {
-                if (b->shared_tile && ly.up_ss.qs && (T >= 256 || b->shared_decode)) {
+                if (b->shared_tile && ly.up_ss.qs && (T >= b->prompt_min_rows || b->shared_decode)) {
                     // the shared expert as one expert over the block's rows: the int8 tile kernel for prompt chunks, the
                     // deep-prefetch kernel for verify blocks (BOLT_SHARED_DECODE=0 keeps the bf16 path for those)
                     const MoeWork sw{b->s_order, b->s_first, b->s_count, b->s_exp, b->s_nwork};
@@ -910,6 +941,10 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
         b->shared_tile = !(st && atoi(st) == 0);
         const char* sd = getenv("BOLT_SHARED_DECODE");
         b->shared_decode = sd && atoi(sd) != 0;
+        if (const char* pm = getenv("BOLT_PROMPT_MIN_ROWS")) b->prompt_min_rows = std::max(1, atoi(pm));
+        const char* f4 = getenv("BOLT_NV4_FP4");   // 0 keeps the fp16 path for prompt chunks (perplexity 3.0418 against 3.0657 on the harness)
+        g_nv4_fp4 = !(f4 && atoi(f4) == 0);
+        prompt_min_rows_set(b->prompt_min_rows);
         const char* kvf = getenv("BOLT_KV");
         b->kv_fp8 = kvf && (!strcmp(kvf, "fp8") || !strcmp(kvf, "e4m3"));
         b->kv_row = b->kv_fp8 ? 256 : 512;
@@ -927,6 +962,7 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
             ly.type = 0;
             ly.in_proj = load_nv4(store, p + ".mixer.in_proj");
             ly.out_proj = load_nv4(store, p + ".mixer.out_proj");
+            if (g_nv4_fp4) { ly.in_projw = load_nv4w(store, p + ".mixer.in_proj"); ly.out_projw = load_nv4w(store, p + ".mixer.out_proj"); }
             ly.conv_w = dev_f32(store, p + ".mixer.conv1d.weight");
             ly.conv_b = dev_f32(store, p + ".mixer.conv1d.bias");
             ly.A_log = dev_f32(store, p + ".mixer.A_log");
@@ -1059,6 +1095,7 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
         const size_t elems = (size_t)TMAX * 8192;
         cudaStream_t ss[3] = {b->s0, b->s1, b->s2};
         for (int i = 0; i < 3; i++) { CK(cudaMalloc(&b->xpack[i], elems * 2)); mma_pack_buffer(ss[i], b->xpack[i], elems); }
+        if (g_nv4_fp4) { CK(cudaMalloc(&b->xq4, (size_t)TMAX * 8192 / 2)); CK(cudaMalloc(&b->xsf4, (size_t)TMAX * 8192 / 16)); }
     }
     CK(cudaEventCreateWithFlags(&b->ev_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&b->ev_j1, cudaEventDisableTiming));

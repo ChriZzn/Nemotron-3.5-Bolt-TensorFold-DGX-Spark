@@ -16,7 +16,7 @@
 #   setup    PREPARE (auto | 1 | 0), PULL, FOREGROUND=1, WAIT_TIMEOUT, DRY_RUN=1, MEM_NEED_GIB, MEM_CHECK=0
 #   engine   every TENSORFOLD_* variable goes into the container (TENSORFOLD_API_KEY by name only)
 #            KV_DTYPE is bf16 (default) or fp8 (e4m3 with a scale per token and head: half the KV memory). VISION=1 (default) loads the image and video tower; VISION_MAX_IMAGES / _MAX_VIDEOS / _IMAGE_TOKENS / _VIDEO_TOKENS size it.
-#            SSM_LAZY=0 keeps two Mamba state copies a stream (see scripts/config.sh); DRAFT_Q8=0 keeps the drafter's projections bf16.
+#            SSM_LAZY=0 keeps two Mamba state copies a stream (see scripts/config.sh); DRAFT_Q8=0 keeps the drafter's projections bf16; NV4_FP4=0 keeps the prompt pass's projections on fp16 rows.
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")"
 source ./scripts/config.sh
@@ -33,7 +33,7 @@ for arg in "$@"; do [[ "$arg" == -h || "$arg" == --help ]] && { usage; exit 0; }
 [[ "$CONTEXT" =~ ^[1-9][0-9]*$ && "$CONTEXT" -le 262144 ]] || die "CONTEXT is a token count up to 262144, not $CONTEXT"
 [[ "$PARALLEL" =~ ^([1-9]|1[0-6])$ ]] || die "PARALLEL is 1 to 16, not $PARALLEL"
 [[ "$MAX_TOKENS" =~ ^[1-9][0-9]*$ ]] || die "MAX_TOKENS is a token count, not $MAX_TOKENS"
-for v in THINKING DRAFTS VISION VISION_URLS SERVE KV_PIN SSM_LAZY DRAFT_Q8; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
+for v in THINKING DRAFTS VISION VISION_URLS SERVE KV_PIN SSM_LAZY DRAFT_Q8 NV4_FP4; do [[ "${!v}" =~ ^[01]$ ]] || die "$v is 0 or 1, not ${!v}"; done
 [[ "$KV_DTYPE" =~ ^(bf16|fp8)$ ]] || die "KV_DTYPE is bf16 or fp8, not $KV_DTYPE (the engine has no int8 or int4 cache)"
 DRY=0; [[ "${DRY_RUN:-0}" == 1 ]] && DRY=1
 
@@ -63,7 +63,7 @@ arg_value() {
 }
 # libbolt keeps one sequence of state per stream (--parallel, which the backend passes on); its cache type and pinning,
 # the Mamba state's copies and the drafter's weight format
-ENV_SEQS=(-e "BOLT_KV=$KV_DTYPE" -e "BOLT_KV_PIN=$KV_PIN" -e "BOLT_SSM_LAZY=$SSM_LAZY" -e "BOLT_DRAFT_Q8=$DRAFT_Q8")
+ENV_SEQS=(-e "BOLT_KV=$KV_DTYPE" -e "BOLT_KV_PIN=$KV_PIN" -e "BOLT_SSM_LAZY=$SSM_LAZY" -e "BOLT_DRAFT_Q8=$DRAFT_Q8" -e "BOLT_NV4_FP4=$NV4_FP4")
 API_HOST="$HOST"; [[ "$HOST" == 0.0.0.0 || "$HOST" == "::" ]] && API_HOST=127.0.0.1
 [[ "$API_HOST" == *:* ]] && API_HOST="[$API_HOST]"
 URL="http://$API_HOST:$PORT"

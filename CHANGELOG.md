@@ -6,8 +6,29 @@ Newest first. This recipe targets one DGX Spark. The image is `tensorfold-nemotr
 ## Unreleased
 
 The Bolt backend serves the checkpoint. Measured on one GB10 (this build, 2026-10-20): decode alone 74 tok/s greedy prose
-and 137 code with LiLiCorr (71 and 133 sampled; 4.3 to 36 without drafts), prefill 1,915 to 2,030 tok/s (from 2.7k to
-21k tokens); sixteen streams at once 284 tok/s aggregate greedy prose, 385 code, 251 and 280 sampled.
+and 137 code with LiLiCorr (71 and 133 sampled; 4.3 to 36 without drafts), prefill 2,310 to 2,510 tok/s from 2.7k to
+42k tokens, 2,255 at 63k and 1,975 at 126k (NV4_FP4=0: about 7 % less); sixteen streams at once 284 tok/s aggregate
+greedy prose, 385 code, 251 and 280 sampled.
+
+### Prompt attention 2.2 to 2.5× at long context, and the fp4 kernel at 154 TFLOPS
+
+The prompt attention kernel ran at 29 TFLOPS whatever the context (instruction-bound: register staging, a 2-byte
+V transpose, 4-byte fragment loads, two barriers a 32-key tile), and at 40k context its eight layers were about
+40 % of a chunk. `attn_mma2_part_k` (`BOLT_ATTN_V2`, default on with the bf16 cache) keeps the same per-warp
+math and MMA order, so its outputs are bit-identical, and stages K and V by `cp.async` into a two-stage ring of
+64 keys with `ldmatrix` / `ldmatrix.trans` fragments and the query block as the fastest grid dimension: 51
+TFLOPS at 8k context, 62 at 40k, 64 at 128k on `engine/tools/attn_bench.cu`. Prefill 2,360 → 2,485 tok/s at 21k
+tokens (+5 %), 2,115 → 2,365 at 42k (+12 %), 1,923 → 2,254 at 63k (+17 %), 1,499 → 1,973 at 126k (+32 %); first
+tokens, the 22.5k-token continuation and decode replies unchanged. `BOLT_ATTN_V2=0` keeps the first kernel.
+
+The fp4 projection kernel went from 133/98 to 154/118 TFLOPS (`in_proj`/`out_proj`): token rows at a 48-byte
+stride, B fragments through `ldmatrix`, the row scales stored step-major (`[k/64][T][4]`, padded to 4 rows so
+a step's 128 words load as 16-byte `cp.async`), two steps of 64 k a barrier in a two-stage ring. Prefill +2 %
+(2,469 at 5.3k, 2,360 at 21k, 2,115 at 42k before the attention change). Bit-identical to the shipped fp4 kernel
+on 118 million outputs at seven row counts (`engine/tools/fp4_cmp.cu`) and the same perplexity (3.0657). Losers:
+a 256-row CTA of 16 warps (142 TFLOPS), one CTA an SM (126). Also tried: nothing else in the attention kernel
+pays without changing the rounding (a 64-key softmax step, lazy rescaling); those are left for a perplexity-gated
+round.
 
 ### TensorFold 1.1.0
 
@@ -32,6 +53,19 @@ and 137 code with LiLiCorr (71 and 133 sampled; 4.3 to 36 without drafts), prefi
 - On the Spark: `scripts/prepare.sh` built `tensorfold-nemotron-bolt:zig-76aafcf` (the Zig build of the server, libbolt,
   libtfvideo and libtfgrammar took 197 s), `./start.sh` served it on a second port beside the running 1.0.12 server
   (loaded in 33 s, smoke test OK), and the two were benchmarked back to back; see the next section.
+
+### The prompt pass's NVFP4 projections on the fp4 tensor cores, and a perplexity harness
+
+`in_proj` and `out_proj` of prompt chunks run on GB10's block-scaled fp4 MMA (`kind::mxf4nvf4`, m16n8k64, e4m3
+scales a block of 16) with the rows quantized to NVFP4 first, as vLLM's NVFP4 path does; the weights' nibbles
+and scales are used as stored, reordered into the MMA's fragment order at load (`tile_nv4w_k`). libbolt now
+builds for `sm_121a`. Exact against a CPU reference on the same quantized inputs; 133 TFLOPS on `in_proj`
+(2.15× the fp16 path), 98 on `out_proj`. Prefill +17 to 20 % (2,425 tok/s at 5.3k tokens, 2,314 at 21k, 2,078
+at 42k). This is the first default that changes the model's numbers: on `engine/tools/ppl.cu` (libbolt's C ABI,
+44.6k tokens of prose and code) perplexity 3.0657 against 3.0418, +0.8 %; the first token of a prompt was
+unchanged at every size tried, later greedy tokens can differ. `NV4_FP4=0` (`BOLT_NV4_FP4=0`) keeps the fp16
+rows. The harness also shows the int8 shared-expert paths at +0.02 % and `BOLT_PROMPT_MIN_ROWS` /
+`BOLT_MOE_TILE_PAIRS` let it exercise the prompt-chunk kernels on 128-row blocks.
 
 ### A tensor-core prompt scan, parked
 

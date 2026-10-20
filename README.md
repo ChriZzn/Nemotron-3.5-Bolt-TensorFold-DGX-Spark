@@ -70,21 +70,23 @@ Every cell's replies were token for token the same as the 1.0.12 build's, with `
 (the tool's `token_sha256` over all three runs).
 
 Prefill (2026-10-20) with a fresh random-word prompt and `max_tokens 1` (so the prompt cache cannot help), in
-tokens a second of prompt: 1,915 to 1,945 at 2.7k tokens, 2,025 to 2,030 at 5.3k, 1,945 at 21k, 1,770 at 42k (the
-1.0.12 build: 1,640, 1,690, 1,650, 1,520). The ceiling of the
-tensor cores for this work is far higher; see [`docs/speed-research.md`](docs/speed-research.md) for where the
-time goes and what is left to do.
+tokens a second of prompt: 2,310 to 2,410 at 2.7k tokens, 2,490 to 2,510 at 5.3k, 2,485 at 21k, 2,365 at 42k,
+2,255 at 63k, 1,975 at 126k (the 1.0.12 build: 1,640, 1,690, 1,650, 1,520, and 987 at 128k). These are with
+`NV4_FP4=1`, the prompt pass's two NVFP4 projections on the fp4 tensor cores with NVFP4 rows, which costs 0.8 %
+perplexity on the harness in `engine/tools`; `NV4_FP4=0` keeps fp16 rows and the exact numbers at about 7 % less.
+The long-context end comes from a prompt attention kernel that is 2.2 to 2.5× the old one with identical outputs.
+See [`docs/speed-research.md`](docs/speed-research.md) for where the time goes and what is left to do.
 
-Prefill, cold prompts of one request:
+Prefill, cold prompts of one request (this build, `max_tokens 1`):
 
 | prompt | prefill | TTFT | tokens |
 | ---: | ---: | ---: | ---: |
-| 4k | 1,575.6 tok/s | 2.80 s | 4,135 |
-| 8k | 1,536.8 tok/s | 5.53 s | 8,231 |
-| 16k | 1,480.8 tok/s | 11.27 s | 16,424 |
-| 32k | 1,375.1 tok/s | 24.03 s | 32,809 |
-| 64k | 1,212.3 tok/s | 54.27 s | 65,579 |
-| 128k | 986.8 tok/s | 133.04 s | 131,115 |
+| 2.7k | 2,312 to 2,408 tok/s | 1.1 s | 2,656 to 2,663 |
+| 5.3k | 2,493 to 2,508 tok/s | 2.1 s | 5,270 to 5,346 |
+| 21k | 2,483 tok/s | 8.5 s | 21,014 to 21,046 |
+| 42k | 2,365 tok/s | 17.8 s | 41,905 to 42,400 |
+| 63k | 2,254 tok/s | 28.1 s | 63,214 |
+| 126k | 1,973 tok/s | 64.1 s | 126,455 |
 
 ## How it is built
 
@@ -296,7 +298,8 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `KV_PIN` | `0` | `1` maps every stream's whole `CONTEXT` window at load and keeps it: `PARALLEL` × `CONTEXT` × 8 KB (bf16) or 4.1 KB (fp8), e.g. 8 × 262,144 = 16 GiB. The memory is then certain, and a start that cannot have it fails at once, naming `PARALLEL`, `CONTEXT` and `KV_DTYPE` |
 | `KV_DTYPE` | `bf16` | `fp8` stores K and V as e4m3 with an fp32 scale per token and head: 4.1 KB a token instead of 8 KB, so twice the tokens in the same memory and half the prompt-cache bytes. Passed to libbolt as `BOLT_KV` (the native server itself refuses `--kv-dtype`). No speed cost; see below |
 | `SSM_LAZY` | `1` | one copy of each stream's Mamba state instead of two: a verify window writes none, and the stream's next forward folds the kept rows in from the saved scan inputs, so a partial accept costs no replay pass and a stream holds 0.28 GiB from load instead of 0.41. Measured: the same replies token for token, 3 to 8 % more tokens a second at 4 to 16 streams, no change alone. `0` is the two-copy path (`BOLT_SSM_LAZY`) |
-| `BOLT_*` | | any `BOLT_*` variable in the environment is passed into the container: libbolt's own switches, e.g. `BOLT_PACK=0` (fp32 GEMM rows), `BOLT_MOE_COOP=0`, `BOLT_PDL=0`, `BOLT_CAL=spread`, `BOLT_PROF=1`, `BOLT_STATS=1`; and the off-by-default experiments `BOLT_IQ2_WHOLE=1`, `BOLT_SHARED_DECODE=1`, `BOLT_DENSE_RING=1`, `BOLT_TILE=1` (see the changelog) |
+| `BOLT_*` | | any `BOLT_*` variable in the environment is passed into the container: libbolt's own switches, e.g. `BOLT_PACK=0` (fp32 GEMM rows), `BOLT_MOE_COOP=0`, `BOLT_ATTN_V2=0` (the first prompt attention kernel), `BOLT_PDL=0`, `BOLT_CAL=spread`, `BOLT_PROF=1`, `BOLT_STATS=1`; and the off-by-default experiments `BOLT_IQ2_WHOLE=1`, `BOLT_SHARED_DECODE=1`, `BOLT_DENSE_RING=1`, `BOLT_TILE=1` (see the changelog) |
+| `NV4_FP4` | `1` | the prompt pass's `in_proj` and `out_proj` on the fp4 tensor cores with the rows quantized to NVFP4 (vLLM's NVFP4 path does the same): prefill +17 to 20 %, perplexity +0.8 % on the harness. `0` keeps fp16 rows (`BOLT_NV4_FP4`) |
 | `DRAFT_Q8` | `1` | the LiLiCorr drafter's attention and kernel projections as Q8_0 instead of bf16, half the bytes a proposal reads. Every draft is checked by the target, so this changes what is proposed, never the reply; `0` keeps bf16 (`BOLT_DRAFT_Q8`). Measured: the same replies and the same speed within noise either way (a proposal takes 6.4 ms against 7.2); Q8_0 keeps 200 MB |
 | `VISION` | `1` | loads TensorFold's RADIO tower and projector (1.7 GB) so requests can carry images and video: `--vision` and the four limits below. `0` serves text only and skips the weights |
 | `VISION_MAX_IMAGES` / `VISION_MAX_VIDEOS` | `64` / `4` | pictures and clips one request may hold |

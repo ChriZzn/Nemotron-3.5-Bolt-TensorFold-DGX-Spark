@@ -326,12 +326,14 @@ __global__ void moe_group_k(const int* __restrict__ ridx, int pairs, int item_b,
 // Pairs a work item holds for a launch of `pairs` pairs.
 bool pdl_on() { static const char* e = getenv("BOLT_PDL"); static const bool on = !(e && atoi(e) == 0); return on; }
 bool moe_tile();
+static int moe_tile_pairs() { static const char* e = getenv("BOLT_MOE_TILE_PAIRS"); static const int v = e ? atoi(e) : 4096; return v; }   // the harness lowers it
 constexpr int MT_BM = 128, MT_BN = 64, MT_BK = 64, MT_STR = MT_BK + 16, MT_STAGES = 3, MT_ITEM = 64;   // the prompt tile kernel's shape
 int moe_item_pairs(int pairs) {
     static const char* e = getenv("BOLT_MOE_B");    // prompt chunks (over 4096 pairs)
     static const char* ed = getenv("BOLT_MOE_BD");  // decode rounds: 8, 16 or 32 pairs an item (an expert's weights are read once an item)
     int v = pairs <= 8 * 9 ? 8 : 16;
-    if (pairs > 4096 && moe_tile()) v = MT_ITEM;   // prompt chunks on the tile kernel
+    if (pairs > 4096 && moe_tile()) v = MT_ITEM;   // prompt chunks on the tile kernel (the threshold is BOLT_MOE_TILE_PAIRS)
+    else if (pairs <= 4096 && moe_tile() && pairs > moe_tile_pairs()) v = MT_ITEM;
     else if (e && pairs > 4096) v = atoi(e);
     else if (ed && pairs <= 4096) { const int d = atoi(ed); if (d == 8 || d == 16 || d == 32) v = d; }
     if (v == 32 && moe_bf16()) v = 16;   // the bf16 kernel stages at most 16 rows (shared memory)
