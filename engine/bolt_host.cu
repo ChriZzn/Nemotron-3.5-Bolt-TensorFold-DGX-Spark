@@ -42,9 +42,10 @@ struct Layer {
     float* norm = nullptr;
     // mamba
     TNV4 in_proj{}, out_proj{};
+    TNV4W in_projw{}, out_projw{};   // the same in the fp4 MMA's fragment order (BOLT_NV4_FP4)
     float *conv_w = nullptr, *conv_b = nullptr, *A_log = nullptr, *D = nullptr, *dt_bias = nullptr, *gnorm = nullptr;
-    float* ssm = nullptr;   // [seq][2][SSM_ELEMS]
-    float *hist_x = nullptr, *hist_dt = nullptr;  // scan inputs of the last record block's rows [BATCH_MAX]
+    float* ssm = nullptr;   // [seq][2][SSM_ELEMS] (one slot a sequence with a lazy state)
+    float *hist_x = nullptr, *hist_dt = nullptr;  // scan inputs of the last record block's rows [BATCH_MAX] (lazy: [seq][2][VERIFY_MAX])
     float* conv = nullptr;  // [seq][CONV_SLOTS][CONV_ELEMS]
     // moe
     TQ8 fc1{}, fc2{};
@@ -52,6 +53,7 @@ struct Layer {
     float* gbias = nullptr;
     int experts = 0, width = 0;
     TIQ2 up_s{}, down_s{};
+    IQ2Slab up_ss{}, down_ss{};   // the same two tensors in the slab layout, for the int8 tile kernel (BOLT_SHARED_TILE)
     IQ2Slab up{}, down{};
     // attention
     TQ8 q{}, k{}, v{}, o{};
@@ -216,6 +218,28 @@ TQ8 load_q8(Store* s, const std::string& name) {
     return m;
 }
 
+bool g_nv4_fp4 = false;   // BOLT_NV4_FP4: prompt chunks' NVFP4 projections on the fp4 tensor cores (rows quantized to NVFP4)
+TNV4W load_nv4w(Store* s, const std::string& name) {
+    TNV4W m{};
+    Info w; const uint8_t* data;
+    if (!lookup(s, name + ".weight", w, data) || w.shape.size() != 2) return m;
+    m.n = (int)w.shape[0]; m.k = (int)w.shape[1] * 2;
+    void* rq = dev_copy(data, w.len);
+    Info sc; const uint8_t* sd;
+    lookup(s, name + ".weight_scale", sc, sd);
+    void* rs = dev_copy(sd, sc.len);
+    Info g; const uint8_t* gd;
+    lookup(s, name + ".weight_scale_2", g, gd);
+    memcpy(&m.s2, gd, 4);
+    void *qw, *sfw;
+    CK(cudaMalloc(&qw, tile_bytes_nv4(m.n, m.k)));
+    CK(cudaMalloc(&sfw, tile_scale_bytes_nv4(m.n, m.k)));
+    tile_nv4w(0, (const uint8_t*)rq, (const uint8_t*)rs, qw, sfw, m.n, m.k);
+    CK(cudaDeviceSynchronize());
+    cudaFree(rq); cudaFree(rs);
+    m.q = (const uint4*)qw; m.sf = (const uint32_t*)sfw;
+    return m;
+}
 TNV4 load_nv4(Store* s, const std::string& name) {
     TNV4 m{};
     Info w; const uint8_t* data;
@@ -306,6 +330,23 @@ bool load_slab(Store* s, const std::string& layer_prefix, const char* proj, int 
     return true;
 }
 
+// one IQ2_XXS tensor as a slab (the shared expert for the int8 tile kernel)
+bool load_slab_one(Store* s, const std::string& name, IQ2Slab& slab) {
+    Info w; const uint8_t* data;
+    if (!lookup(s, name + ".weight", w, data) || w.shape.size() != 3 || w.shape[2] != 66) return false;
+    const int rows = (int)w.shape[0], k = (int)w.shape[1] * 256, nb = k / 256;
+    uint8_t* raw = nullptr; uint8_t* qs = nullptr; void* d = nullptr;
+    CK(cudaMalloc(&raw, w.len));
+    CK(cudaMalloc(&qs, (size_t)rows * nb * 64));
+    CK(cudaMalloc(&d, (size_t)rows * nb * 2));
+    CK(cudaMemcpy(raw, data, w.len, cudaMemcpyHostToDevice));
+    repack_iq2(0, raw, qs, d, (size_t)rows, k);
+    CK(cudaDeviceSynchronize());
+    cudaFree(raw);
+    slab.qs = qs; slab.d = d; slab.qs_stride = (size_t)rows * nb * 64; slab.d_stride = (size_t)rows * nb;
+    return true;
+}
+
 std::vector<std::string> block_types(const std::string& cfg) {
     std::vector<std::string> t;
     size_t p = cfg.find("\"block_configs\"");
@@ -365,10 +406,14 @@ struct KvPool {
     size_t reserve_free = 0;               // device bytes left free for everything else
 };
 
+struct Bolt;
+extern "C" void bolt_prof_report(Bolt* b);
+
 struct Bolt {
     int context = 32768;
     bool kv_pin = false;     // BOLT_KV_PIN=1: every sequence's whole window is mapped at load and kept
     bool kv_fp8 = false;     // BOLT_KV=fp8: K and V as e4m3 with a scale per token and head
+    bool ssm_lazy = false;   // BOLT_SSM_LAZY=1: one SSM slot a sequence; a window's kept rows are folded in by its next block
     int kv_row = 512;        // bytes of one token's 256 K (or V) values
     int kv_stride = 32768;   // tokens between sequences in the KV buffers (the window rounded up to a granule)
     KvPool kv;
@@ -383,7 +428,15 @@ struct Bolt {
     float *x = nullptr, *xn = nullptr, *r1 = nullptr, *r2 = nullptr, *proj = nullptr, *xbc = nullptr, *ybuf = nullptr, *gout = nullptr;
     float *qb = nullptr, *kb = nullptr, *vb = nullptr, *apart = nullptr, *aout = nullptr;
     float *glog = nullptr, *lat = nullptr, *lat2 = nullptr, *rw = nullptr, *act = nullptr, *mo = nullptr, *sact = nullptr;
+    bool shared_tile = false;     // BOLT_SHARED_TILE: prompt chunks' shared expert on the int8 tile kernel
+    bool shared_decode = false;   // BOLT_SHARED_DECODE: verify blocks' shared expert on the int8 deep-prefetch kernel too
+    int prompt_min_rows = 256;    // BOLT_PROMPT_MIN_ROWS: rows from which a block takes the prompt-chunk kernels (the perplexity harness lowers it)
+    int8_t* xq_s = nullptr; float* xs_s = nullptr;   // its int8 rows (up to 5376 wide) and scales
+    int *s_order = nullptr, *s_first = nullptr, *s_count = nullptr, *s_exp = nullptr, *s_nwork = nullptr;
     int *ridx = nullptr, *order = nullptr, *wfirst = nullptr, *wcount = nullptr, *wexp = nullptr, *nwork = nullptr;
+    int* moe_stat = nullptr;      // BOLT_PROF: distinct experts and work items, summed over the MoE launches since the last report
+    uint16_t* xpack[3] = {nullptr, nullptr, nullptr};   // the GEMMs' packed rows, one scratch a stream
+    uint8_t* xq4 = nullptr; uint8_t* xsf4 = nullptr;      // rows as NVFP4 for the fp4 projections (main stream only)
     int8_t *xq_t = nullptr, *xq_p = nullptr;   // int8 inputs of the expert kernels: per token (up) and per pair (down)
     float *xs_t = nullptr, *xs_p = nullptr;
     float* logits = nullptr;
@@ -410,6 +463,7 @@ struct Bolt {
         int len = 0;                    // tokens in the cache
         int ssm = 0, conv = 0;          // current SSM slot (0/1) and conv ring slot
         int last_rows = 0, last_row0 = 0, last_ssm = 0, last_conv = 0, last_len = 0, last_record = 0;
+        int pending = 0, hist = 0;      // lazy state: kept rows of the last window not folded in yet, and their saved-input slot
         int ing_pos0 = 0, ing_n = 0, ing_row0 = 0;  // rows of the last block the drafter has not absorbed yet
         int ingest_floor = 0;           // positions below this never reach the drafter's window
     };
@@ -421,7 +475,10 @@ struct Bolt {
     Draft* draft = nullptr;
     double cost_ms[VERIFY_MAX + 1] = {};
     std::vector<std::pair<int, double>> shared_ms;  // forward ms of a block of that many rows over several sequences
-    bool prof = false;  // BOLT_PROF: eager launches with an event after every stage
+    bool prof = false;  // BOLT_PROF: eager launches with an event after every stage; a report every BOLT_PROF_EVERY (100) blocks
+    bool prof_serial = false;   // BOLT_PROF=2: the shared expert and fc1 on the main stream too, so every stage's time is its own
+    int prof_blocks = 0, prof_every = 100;
+    long prof_rows = 0; int prof_rows_n = 0;   // rows of the blocks since the last report
     std::vector<cudaEvent_t> prof_ev;
     std::vector<const char*> prof_name;
     std::unordered_map<std::string, std::pair<double, int>> prof_acc;
@@ -562,7 +619,7 @@ void prof_collect(Bolt* b) {
 
 void enqueue_block(Bolt* b, int T, int record, int cand_k, int last_only, int nseg, int split_log) {
     mma_decode_rows(record != 0);
-    cudaStream_t s0 = b->s0, s1 = b->s1, s2 = b->s2;
+    cudaStream_t s0 = b->s0, s1 = b->prof_serial ? b->s0 : b->s1, s2 = b->prof_serial ? b->s0 : b->s2;
     const Ctl* ctl = b->ctl_d;
     mark(b, "start");
     k_embed(s0, b->embed, b->xemb, ctl, b->x, T);
@@ -576,14 +633,20 @@ void enqueue_block(Bolt* b, int T, int record, int cand_k, int last_only, int ns
         k_add_rms(s0, b->x, r1, r2, ly.norm, b->xn, cap, 6 * HID, b->eps, T);
         mark(b, "add_rms");
         if (ly.type == 0) {
-            if (!skip("inproj")) mma_nv4(s0, ly.in_proj, b->xn, HID, b->proj, PROJ, T);
+            if (!skip("inproj")) {
+                if (g_nv4_fp4 && !record && T >= b->prompt_min_rows) { quant_nv4_rows(s0, b->xn, HID, b->xq4, b->xsf4, T, HID); mma_nv4_fp4(s0, ly.in_projw, b->xq4, b->xsf4, b->proj, PROJ, T); }
+                else mma_nv4(s0, ly.in_proj, b->xn, HID, b->proj, PROJ, T);
+            }
             mark(b, "mamba.in_proj");
-            k_conv(s0, ctl, ly.conv, ly.conv_w, ly.conv_b, b->proj, PROJ, b->xbc, T, record, record ? ly.hist_x : nullptr, record ? ly.hist_dt : nullptr, nseg);
-            if (!skip("scan")) k_scan(s0, ctl, ly.ssm, b->xbc, b->proj, PROJ, ly.A_log, ly.dt_bias, ly.D, b->ybuf, T, record, nseg);
+            k_conv(s0, ctl, ly.conv, ly.conv_w, ly.conv_b, b->proj, PROJ, b->xbc, T, record, record ? ly.hist_x : nullptr, record ? ly.hist_dt : nullptr, nseg, b->ssm_lazy);
+            if (!skip("scan")) k_scan(s0, ctl, ly.ssm, b->xbc, b->proj, PROJ, ly.A_log, ly.dt_bias, ly.D, b->ybuf, T, record, nseg, b->ssm_lazy, ly.hist_x, ly.hist_dt);
             mark(b, "mamba.conv+scan");
             k_gate_rms(s0, b->ybuf, b->proj, PROJ, ly.gnorm, b->gout, b->eps, T);
             mark(b, "mamba.gate_rms");
-            if (!skip("outproj")) mma_nv4(s0, ly.out_proj, b->gout, 8192, b->r1, HID, T);
+            if (!skip("outproj")) {
+                if (g_nv4_fp4 && !record && T >= b->prompt_min_rows) { quant_nv4_rows(s0, b->gout, 8192, b->xq4, b->xsf4, T, 8192); mma_nv4_fp4(s0, ly.out_projw, b->xq4, b->xsf4, b->r1, HID, T); }
+                else mma_nv4(s0, ly.out_proj, b->gout, 8192, b->r1, HID, T);
+            }
             mark(b, "mamba.out_proj");
         } else if (ly.type == 2) {
             TQ8Multi m{};
@@ -606,30 +669,53 @@ void enqueue_block(Bolt* b, int T, int record, int cand_k, int last_only, int ns
             CK(cudaStreamWaitEvent(s1, b->ev_fork));
             CK(cudaStreamWaitEvent(s2, b->ev_fork));
             // shared expert
-            if (!skip("shared")) { mma_iq2(s1, ly.up_s, b->xn, HID, b->sact, ly.up_s.n, T, 1);
-            mma_iq2(s1, ly.down_s, b->sact, ly.up_s.n, b->r2, HID, T); }
+            if (!skip("shared")) {
+                if (b->shared_tile && ly.up_ss.qs && (T >= b->prompt_min_rows || b->shared_decode)) {
+                    // the shared expert as one expert over the block's rows: the int8 tile kernel for prompt chunks, the
+                    // deep-prefetch kernel for verify blocks (BOLT_SHARED_DECODE=0 keeps the bf16 path for those)
+                    const MoeWork sw{b->s_order, b->s_first, b->s_count, b->s_exp, b->s_nwork};
+                    auto dense = T >= 256 ? moe_tile_dense : moe_coop_dense;
+                    k_quant_rows(s1, b->xn, HID, b->xq_s, HID, b->xs_s, HID / 32, T, HID);
+                    dense(s1, ly.up_ss, sw, T, b->xq_s, b->xs_s, b->sact, ly.up_s.n, ly.up_s.n, HID, 1);
+                    k_quant_rows(s1, b->sact, ly.up_s.n, b->xq_s, ly.up_s.n, b->xs_s, ly.up_s.n / 32, T, ly.up_s.n);
+                    dense(s1, ly.down_ss, sw, T, b->xq_s, b->xs_s, b->r2, HID, HID, ly.up_s.n, 0);
+                } else {
+                    mma_iq2(s1, ly.up_s, b->xn, HID, b->sact, ly.up_s.n, T, 1);
+                    mma_iq2(s1, ly.down_s, b->sact, ly.up_s.n, b->r2, HID, T);
+                }
+            }
             CK(cudaEventRecord(b->ev_j1, s1));
+            if (b->prof_serial) mark(b, "moe.shared");
             // latent projection
             if (!skip("fc")) mma_q8(s2, ly.fc1, b->xn, HID, b->lat, 1024, T);
             CK(cudaEventRecord(b->ev_j2, s2));
+            if (b->prof_serial) mark(b, "moe.fc1");
             // routing
             if (!skip("gate")) mma_bf16(s0, ly.gate, b->xn, HID, b->glog, 512, T);
             mark(b, "moe.gate");
             if (!skip("route")) k_route(s0, b->glog, 512, ly.gbias, b->ridx, b->rw, ly.experts, b->route_scale, T);
             mark(b, "moe.route");
             const int pairs = T * TOPN;
-            k_moe_group(s0, b->ridx, pairs, b->order, b->wfirst, b->wcount, b->wexp, b->nwork);
+            k_moe_group(s0, b->ridx, pairs, b->order, b->wfirst, b->wcount, b->wexp, b->nwork, b->prof ? b->moe_stat : nullptr);
             mark(b, "moe.group");
             CK(cudaStreamWaitEvent(s0, b->ev_j2));
             mark(b, "moe.wait_fc1");
             MoeWork mw{b->order, b->wfirst, b->wcount, b->wexp, b->nwork};
             if (!skip("experts")) {
-                k_quant_rows(s0, b->lat, 1024, b->xq_t, 1024, b->xs_t, 32, T, 1024);
-                moe_up(s0, ly.up, mw, b->xq_t, b->xs_t, b->act, ly.width, pairs);
-                mark(b, "moe.up");
-                k_quant_rows(s0, b->act, ly.width, b->xq_p, ly.width, b->xs_p, ly.width / 32, pairs, ly.width);
-                moe_down(s0, ly.down, mw, b->xq_p, b->xs_p, b->mo, ly.width, pairs);
-                mark(b, "moe.down");
+                static const bool bf = moe_bf16();
+                if (bf) {
+                    moe_up_bf(s0, ly.up, mw, b->lat, 1024, b->act, ly.width, pairs);
+                    mark(b, "moe.up");
+                    moe_down_bf(s0, ly.down, mw, b->act, ly.width, b->mo, ly.width, pairs);
+                    mark(b, "moe.down");
+                } else {
+                    k_quant_rows(s0, b->lat, 1024, b->xq_t, 1024, b->xs_t, 32, T, 1024);
+                    moe_up(s0, ly.up, mw, b->xq_t, b->xs_t, b->act, ly.width, pairs);
+                    mark(b, "moe.up");
+                    k_quant_rows(s0, b->act, ly.width, b->xq_p, ly.width, b->xs_p, ly.width / 32, pairs, ly.width);
+                    moe_down(s0, ly.down, mw, b->xq_p, b->xs_p, b->mo, ly.width, pairs);
+                    mark(b, "moe.down");
+                }
             }
             k_combine(s0, b->mo, b->rw, b->lat2, T);
             if (!skip("fc")) mma_q8(s0, ly.fc2, b->lat2, 1024, b->r1, HID, T);
@@ -734,8 +820,10 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
         h->seg_row0[i] = row;
         h->seg_base[i] = q.len;
         h->seg_seq[i] = sg[i].seq;
-        h->seg_ssm[i] = q.ssm;
+        h->seg_ssm[i] = b->ssm_lazy ? 0 : q.ssm;
         h->seg_conv[i] = q.conv;
+        h->seg_replay[i] = b->ssm_lazy ? q.pending : 0;
+        h->seg_hist[i] = q.hist;
         for (int t = 0; t < sg[i].rows; t++) h->tokens[row + t] = sg[i].tokens[t];
         row += sg[i].rows;
     }
@@ -776,7 +864,7 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
         CK(cudaMemcpyAsync(b->cids_h.data(), b->cids, (size_t)rows * CAND * 4, cudaMemcpyDeviceToHost, b->s0));
     }
     CK(cudaStreamSynchronize(b->s0));
-    if (b->prof) prof_collect(b);
+    if (b->prof) { prof_collect(b); b->prof_rows += real_rows; b->prof_rows_n++; if (++b->prof_blocks % b->prof_every == 0) bolt_prof_report(b); }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         fprintf(stderr, "bolt: forward T=%d: %s\n", T, cudaGetErrorString(e));
@@ -797,7 +885,10 @@ int run_blocks(Bolt* b, const SegIn* sg, int nseg, int record, int cand_k, int l
         q.ing_row0 = h->seg_row0[i];
         // the block advanced every segment as if all its rows were kept; keep() cuts it back
         q.conv = record ? (q.conv + rows) % CONV_SLOTS : (q.conv + 1) % CONV_SLOTS;
-        q.ssm ^= 1;
+        if (b->ssm_lazy) {
+            q.pending = 0;              // folded into the state by this block's scan
+            if (record) q.hist ^= 1;    // the block saved its rows' inputs in the other slot
+        } else q.ssm ^= 1;
         q.len += rows;
     }
     return 0;
@@ -813,6 +904,12 @@ int run_block(Bolt* b, int seq, const int* tokens, int T, int record, int cand_k
 static void bolt_calibrate(Bolt* b);
 
 extern "C" Bolt* bolt_open(const char* dir, int context) {
+    {
+        // BOLT_SPIN=0 leaves the driver's default wait; spinning on the host while a forward runs skips the wake-up
+        // latency of a yielding wait after every sync (llama.cpp measured a large decode gain from this on GB10)
+        const char* sp = getenv("BOLT_SPIN");
+        if (!sp || atoi(sp) != 0) CK(cudaSetDeviceFlags(cudaDeviceScheduleSpin));
+    }
     CK(cudaFree(0));
     fprintf(stderr, "bolt: loading %s\n", dir);
     std::string cfg = slurp(std::string(dir) + "/config.json");
@@ -838,6 +935,16 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     {
         int n_att = 0;
         for (auto& t : types) n_att += t == "attention";
+        const char* lz = getenv("BOLT_SSM_LAZY");
+        b->ssm_lazy = lz && atoi(lz) != 0;
+        const char* st = getenv("BOLT_SHARED_TILE");   // 0 keeps the shared expert's bf16 path for prompt chunks
+        b->shared_tile = !(st && atoi(st) == 0);
+        const char* sd = getenv("BOLT_SHARED_DECODE");
+        b->shared_decode = sd && atoi(sd) != 0;
+        if (const char* pm = getenv("BOLT_PROMPT_MIN_ROWS")) b->prompt_min_rows = std::max(1, atoi(pm));
+        const char* f4 = getenv("BOLT_NV4_FP4");   // 0 keeps the fp16 path for prompt chunks (perplexity 3.0418 against 3.0657 on the harness)
+        g_nv4_fp4 = !(f4 && atoi(f4) == 0);
+        prompt_min_rows_set(b->prompt_min_rows);
         const char* kvf = getenv("BOLT_KV");
         b->kv_fp8 = kvf && (!strcmp(kvf, "fp8") || !strcmp(kvf, "e4m3"));
         b->kv_row = b->kv_fp8 ? 256 : 512;
@@ -855,18 +962,22 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
             ly.type = 0;
             ly.in_proj = load_nv4(store, p + ".mixer.in_proj");
             ly.out_proj = load_nv4(store, p + ".mixer.out_proj");
+            if (g_nv4_fp4) { ly.in_projw = load_nv4w(store, p + ".mixer.in_proj"); ly.out_projw = load_nv4w(store, p + ".mixer.out_proj"); }
             ly.conv_w = dev_f32(store, p + ".mixer.conv1d.weight");
             ly.conv_b = dev_f32(store, p + ".mixer.conv1d.bias");
             ly.A_log = dev_f32(store, p + ".mixer.A_log");
             ly.D = dev_f32(store, p + ".mixer.D");
             ly.dt_bias = dev_f32(store, p + ".mixer.dt_bias");
             ly.gnorm = dev_f32(store, p + ".mixer.norm.weight");
-            CK(cudaMalloc(&ly.ssm, (size_t)b->nseq * 2 * SSM_ELEMS * 4));
+            const size_t slots = b->ssm_lazy ? 1 : 2, hist_rows = b->ssm_lazy ? (size_t)b->nseq * 2 * VERIFY_MAX : BATCH_MAX;
+            CK(cudaMalloc(&ly.ssm, (size_t)b->nseq * slots * SSM_ELEMS * 4));
             CK(cudaMalloc(&ly.conv, (size_t)b->nseq * CONV_SLOTS * CONV_ELEMS * 4));
-            CK(cudaMemset(ly.ssm, 0, (size_t)b->nseq * 2 * SSM_ELEMS * 4));
+            CK(cudaMemset(ly.ssm, 0, (size_t)b->nseq * slots * SSM_ELEMS * 4));
             CK(cudaMemset(ly.conv, 0, (size_t)b->nseq * CONV_SLOTS * CONV_ELEMS * 4));
-            CK(cudaMalloc(&ly.hist_x, (size_t)BATCH_MAX * 10240 * 4));
-            CK(cudaMalloc(&ly.hist_dt, (size_t)BATCH_MAX * 128 * 4));
+            CK(cudaMalloc(&ly.hist_x, hist_rows * HIST_ROW * 4));
+            CK(cudaMalloc(&ly.hist_dt, hist_rows * 128 * 4));
+            CK(cudaMemset(ly.hist_x, 0, hist_rows * HIST_ROW * 4));
+            CK(cudaMemset(ly.hist_dt, 0, hist_rows * 128 * 4));
             mi++;
         } else if (types[li] == "moe") {
             ly.type = 1;
@@ -882,6 +993,12 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
             ly.gbias = dev_f32(store, p + ".mixer.gate.e_score_correction_bias");
             ly.up_s = load_iq2(store, p + ".mixer.shared_experts.up_proj");
             ly.down_s = load_iq2(store, p + ".mixer.shared_experts.down_proj");
+            if (b->shared_tile) {
+                if (!load_slab_one(store, p + ".mixer.shared_experts.up_proj", ly.up_ss) || !load_slab_one(store, p + ".mixer.shared_experts.down_proj", ly.down_ss)) {
+                    fprintf(stderr, "bolt: shared expert slab of layer %zu failed; BOLT_SHARED_TILE off for it\n", li);
+                    ly.up_ss.qs = nullptr;
+                }
+            }
             if (!load_slab(store, p, "up_proj", experts, width, 1024, ly.up) ||
                 !load_slab(store, p, "down_proj", experts, 1024, width, ly.down)) return nullptr;
             oi++;
@@ -921,6 +1038,8 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
         CK(cudaMemcpy(b->replay, tab.data(), tab.size() * sizeof(ReplayLayer), cudaMemcpyHostToDevice));
     }
     b->prof = getenv("BOLT_PROF") != nullptr;
+    b->prof_serial = b->prof && atoi(getenv("BOLT_PROF")) == 2;
+    if (const char* pe = getenv("BOLT_PROF_EVERY")) b->prof_every = std::max(1, atoi(pe));
     auto zalloc = [&](float** p, size_t floats) { CK(cudaMalloc(p, floats * 4)); CK(cudaMemset(*p, 0, floats * 4)); };
     CK(cudaMalloc(&b->xemb, (size_t)TMAX * HID * 2));
     zalloc(&b->x, (size_t)TMAX * HID);
@@ -943,6 +1062,11 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     zalloc(&b->act, (size_t)TMAX * TOPN * 2560);
     zalloc(&b->mo, (size_t)TMAX * TOPN * 1024);
     zalloc(&b->sact, (size_t)TMAX * 5376);
+    if (b->shared_tile) {
+        CK(cudaMalloc(&b->xq_s, (size_t)TMAX * 5376)); CK(cudaMalloc(&b->xs_s, (size_t)TMAX * (5376 / 32) * 4));
+        CK(cudaMalloc(&b->s_order, (size_t)TMAX * 4)); CK(cudaMalloc(&b->s_first, (size_t)TMAX * 4)); CK(cudaMalloc(&b->s_count, (size_t)TMAX * 4));
+        CK(cudaMalloc(&b->s_exp, (size_t)TMAX * 4)); CK(cudaMalloc(&b->s_nwork, 4));
+    }
     zalloc(&b->logits, (size_t)LOGIT_ROWS * VOCAB);
     zalloc(&b->cap, (size_t)TMAX * 6 * HID);
     zalloc(&b->cvals, (size_t)LOGIT_ROWS * CAND);
@@ -950,6 +1074,7 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     CK(cudaMalloc(&b->ridx, (size_t)TMAX * TOPN * 4));
     CK(cudaMalloc(&b->order, (size_t)TMAX * TOPN * 4));
     CK(cudaMalloc(&b->wfirst, (size_t)TMAX * TOPN * 4)); CK(cudaMalloc(&b->wcount, (size_t)TMAX * TOPN * 4)); CK(cudaMalloc(&b->wexp, (size_t)TMAX * TOPN * 4)); CK(cudaMalloc(&b->nwork, 4));
+    CK(cudaMalloc(&b->moe_stat, 8)); CK(cudaMemset(b->moe_stat, 0, 8));
     CK(cudaMalloc(&b->xq_t, (size_t)TMAX * 1024)); CK(cudaMalloc(&b->xs_t, (size_t)TMAX * 32 * 4));
     CK(cudaMalloc(&b->xq_p, (size_t)TMAX * TOPN * 2560)); CK(cudaMalloc(&b->xs_p, (size_t)TMAX * TOPN * 80 * 4));
     CK(cudaMalloc(&b->cids, (size_t)LOGIT_ROWS * CAND * 4));
@@ -965,6 +1090,13 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     CK(cudaStreamCreateWithFlags(&b->s0, cudaStreamNonBlocking));
     CK(cudaStreamCreateWithFlags(&b->s1, cudaStreamNonBlocking));
     CK(cudaStreamCreateWithFlags(&b->s2, cudaStreamNonBlocking));
+    {
+        // packed rows for the GEMMs: TMAX rows (a prompt chunk) of the widest K (out_proj's 8192), one scratch a stream (48 MB)
+        const size_t elems = (size_t)TMAX * 8192;
+        cudaStream_t ss[3] = {b->s0, b->s1, b->s2};
+        for (int i = 0; i < 3; i++) { CK(cudaMalloc(&b->xpack[i], elems * 2)); mma_pack_buffer(ss[i], b->xpack[i], elems); }
+        if (g_nv4_fp4) { CK(cudaMalloc(&b->xq4, (size_t)TMAX * 8192 / 2)); CK(cudaMalloc(&b->xsf4, (size_t)TMAX * 8192 / 16)); }
+    }
     CK(cudaEventCreateWithFlags(&b->ev_fork, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&b->ev_j1, cudaEventDisableTiming));
     CK(cudaEventCreateWithFlags(&b->ev_j2, cudaEventDisableTiming));
@@ -978,7 +1110,7 @@ extern "C" Bolt* bolt_open(const char* dir, int context) {
     CK(cudaDeviceSynchronize());
     size_t fr = 0, tot = 0;
     cudaMemGetInfo(&fr, &tot);
-    fprintf(stderr, "bolt: weights resident, %d mamba %d moe %d attention, %d sequence%s of context %d (%s KV), %.1f GiB free\n", mi, oi, ai, b->nseq, b->nseq == 1 ? "" : "s", b->context, b->kv_fp8 ? "fp8" : "bf16", fr / 1073741824.0);
+    fprintf(stderr, "bolt: weights resident, %d mamba %d moe %d attention, %d sequence%s of context %d (%s KV, %s SSM state), %.1f GiB free\n", mi, oi, ai, b->nseq, b->nseq == 1 ? "" : "s", b->context, b->kv_fp8 ? "fp8" : "bf16", b->ssm_lazy ? "one-slot lazy" : "two-slot", fr / 1073741824.0);
     if (b->kv.lazy && getenv("BOLT_KV_PIN") && atoi(getenv("BOLT_KV_PIN")) != 0) {
         // map every sequence's whole window now, so the memory is certain (a start that cannot have it fails here)
         for (int q = 0; q < b->nseq; q++) {
@@ -1004,7 +1136,7 @@ extern "C" Bolt* bolt_load(const char* dir) {
 
 
 // The C ABI version bolt_native.zig checks at load: bump it with any change to the calls below.
-extern "C" int bolt_abi() { return 2; }
+extern "C" int bolt_abi() { return 3; }
 
 extern "C" int bolt_seqs(Bolt* b) { return b->nseq; }
 extern "C" int bolt_context(Bolt* b) { return b->context; }
@@ -1012,7 +1144,8 @@ extern "C" int bolt_context(Bolt* b) { return b->context; }
 // Device bytes one more sequence holds at this context: both SSM slots and the conv ring of every Mamba layer, the
 // KV rows of every attention layer, the drafter's rings.
 extern "C" uint64_t bolt_seq_bytes(Bolt* b) {
-    return (uint64_t)b->mamba_layers * (2 * (uint64_t)SSM_ELEMS + (uint64_t)CONV_SLOTS * CONV_ELEMS) * 4 + (uint64_t)(b->kv.lazy && !b->kv_pin ? b->kv.tokens_per_gran : b->context) * kv_token_bytes(b) +
+    const uint64_t ssm = b->ssm_lazy ? (uint64_t)SSM_ELEMS + 2ull * VERIFY_MAX * (HIST_ROW + 128) : 2 * (uint64_t)SSM_ELEMS;
+    return (uint64_t)b->mamba_layers * (ssm + (uint64_t)CONV_SLOTS * CONV_ELEMS) * 4 + (uint64_t)(b->kv.lazy && !b->kv_pin ? b->kv.tokens_per_gran : b->context) * kv_token_bytes(b) +
            (b->draft ? draft_blob_bytes() : 0);
 }
 
@@ -1062,7 +1195,7 @@ extern "C" void bolt_reset_seq(Bolt* b, int seq) {
     q = Bolt::Seq();
     q.used = used;
     for (Layer& ly : b->layers) if (ly.type == 0) {
-        CK(cudaMemsetAsync(ly.ssm + (size_t)seq * 2 * SSM_ELEMS, 0, (size_t)SSM_ELEMS * 4, b->s0));
+        CK(cudaMemsetAsync(ly.ssm + (size_t)seq * (b->ssm_lazy ? 1 : 2) * SSM_ELEMS, 0, (size_t)SSM_ELEMS * 4, b->s0));
         CK(cudaMemsetAsync(ly.conv + (size_t)seq * CONV_SLOTS * CONV_ELEMS, 0, (size_t)CONV_ELEMS * 4, b->s0));
     }
     CK(cudaStreamSynchronize(b->s0));
@@ -1128,17 +1261,23 @@ extern "C" void bolt_candidates(Bolt* b, int row, int k, float* vals, int* ids) 
     memcpy(ids, &b->cids_h[(size_t)row * CAND], (size_t)k * 4);
 }
 
-// Keep the first n rows of the sequence's last record block (idempotent for the same n).
-extern "C" void bolt_keep_seq(Bolt* b, int seq, int n) {
+// Keep the first n rows of the sequence's last record block (idempotent for the same n). Returns whether a replay was
+// launched on s0 (the caller synchronizes).
+static bool keep_rows(Bolt* b, int seq, int n) {
     Bolt::Seq& q = b->seqs[seq];
     if (n < 0) n = 0;
     if (n > q.last_rows) n = q.last_rows;
-    if (!q.last_record) return;
-    if (n < q.last_rows) {
+    if (!q.last_record) return false;
+    bool launched = false;
+    if (b->ssm_lazy) {
+        // the window wrote no state: its first n rows are folded in by the sequence's next block
+        q.pending = n;
+        q.last_rows = n;
+    } else if (n < q.last_rows) {
         if (n > 0 && b->replay) {
             // the window kept only its final state: rebuild the one after row n from the pre-window state
             k_scan_replay(b->s0, b->replay, b->mamba_layers, seq, q.last_ssm, q.last_row0, n);
-            CK(cudaStreamSynchronize(b->s0));
+            launched = true;
         }
         q.ssm = n == 0 ? q.last_ssm : (q.last_ssm ^ 1);
         q.last_rows = n;
@@ -1146,6 +1285,29 @@ extern "C" void bolt_keep_seq(Bolt* b, int seq, int n) {
     q.conv = (q.last_conv + n) % CONV_SLOTS;
     q.len = q.last_len + n;
     q.ing_n = n;
+    return launched;
+}
+
+extern "C" void bolt_keep_seq(Bolt* b, int seq, int n) {
+    if (keep_rows(b, seq, n)) CK(cudaStreamSynchronize(b->s0));
+}
+
+// The same for several sequences at once: their replays go out together and the host waits once.
+extern "C" void bolt_keep_multi(Bolt* b, int n, const int* seqs, const int* counts) {
+    bool launched = false;
+    for (int i = 0; i < n; i++) {
+        if (seqs[i] < 0 || seqs[i] >= b->nseq) continue;
+        launched |= keep_rows(b, seqs[i], counts[i]);
+    }
+    if (launched) CK(cudaStreamSynchronize(b->s0));
+}
+
+// Lazy state: fold the pending rows into the sequence's state now (a snapshot copies the state after them).
+static void fold_pending(Bolt* b, int seq) {
+    Bolt::Seq& q = b->seqs[seq];
+    if (!b->ssm_lazy || q.pending <= 0) return;
+    k_scan_fold(b->s0, b->replay, b->mamba_layers, seq, q.hist, q.pending);
+    q.pending = 0;
 }
 
 // Tell the drafter where the sequence's whole prompt ends: rows more than its window before that are never ingested.
@@ -1284,13 +1446,9 @@ static void bolt_calibrate(Bolt* b) {
         // the rows route to different experts like real streams do
         int mix[BATCH_MAX];
         for (int i = 0; i < BATCH_MAX; i++) mix[i] = 1000 + (int)((i * 2654435761u + 12345u) % 90000u);
-        // R rows over as many sequences as there are (at most one row each below nseq), the costliest spread: the
-        // recurrent state of every sequence in the block is read and written whatever its rows
-        for (int R : {2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128}) {
-            int nseg = R < b->nseq ? R : b->nseq;
-            if (R > nseg * VERIFY_MAX) continue;
-            int seqs[SEG_MAX], rows[SEG_MAX];
-            for (int i = 0; i < nseg; i++) { seqs[i] = i; rows[i] = R / nseg + (i < R % nseg ? 1 : 0); }
+        auto shared = [&](int nseg, const int* rows) {
+            int seqs[SEG_MAX];
+            for (int i = 0; i < nseg; i++) seqs[i] = i;
             double best = 1e30;
             for (int rep = 0; rep < 5; rep++) {
                 double t0 = now();
@@ -1299,7 +1457,45 @@ static void bolt_calibrate(Bolt* b) {
                 for (int i = 0; i < nseg; i++) { bolt_keep_seq(b, seqs[i], 0); b->seqs[seqs[i]].ing_n = 0; }
                 if (rep >= 2 && t1 - t0 < best) best = t1 - t0;
             }
-            if (best < 1e29) b->shared_ms.push_back({R, best});
+            return best;
+        };
+        const char* cal = getenv("BOLT_CAL");
+        if (cal && !strcmp(cal, "spread")) {
+            // R rows over as many sequences as there are (at most one row each below nseq), the costliest spread: the
+            // recurrent state of every sequence in the block is read and written whatever its rows
+            for (int R : {2, 4, 8, 12, 16, 24, 32, 48, 64, 96, 128}) {
+                int nseg = R < b->nseq ? R : b->nseq;
+                if (R > nseg * VERIFY_MAX) continue;
+                int rows[SEG_MAX];
+                for (int i = 0; i < nseg; i++) rows[i] = R / nseg + (i < R % nseg ? 1 : 0);
+                double best = shared(nseg, rows);
+                if (best < 1e29) b->shared_ms.push_back({R, best});
+            }
+        } else {
+            // The round loop prices a shared round as this table at its total rows plus an overhead it measures per
+            // stream count. So the table holds what rows cost, not streams: one stream's windows, then the cost of a
+            // row measured with every sequence in the block (1 row each against 8 each: the same states, more rows),
+            // and the state of each further stream lands in the per-count overhead the loop learns.
+            double ms1 = 0, ms8 = 0;
+            int r1 = 0, r8 = 0;
+            for (int per : {1, 8}) {
+                const int R = b->nseq * per;
+                if (R > BATCH_MAX) break;
+                int rows[SEG_MAX];
+                for (int i = 0; i < b->nseq; i++) rows[i] = per;
+                const double best = shared(b->nseq, rows);
+                if (best >= 1e29) break;
+                if (per == 1) { ms1 = best; r1 = R; } else { ms8 = best; r8 = R; }
+            }
+            double slope = r8 > r1 && ms8 > ms1 ? (ms8 - ms1) / (r8 - r1) : 0;
+            if (slope <= 0) slope = (b->cost_ms[VERIFY_MAX] - b->cost_ms[1]) / (VERIFY_MAX - 1);
+            if (slope < 0.1) slope = 0.1;
+            fprintf(stderr, "bolt: shared rounds of %d streams: %d rows %.1f ms, %d rows %.1f ms; %.2f ms a row\n", b->nseq, r1, ms1, r8, ms8, slope);
+            for (int R : {2, 4, 8}) b->shared_ms.push_back({R, b->cost_ms[R]});
+            for (int R : {12, 16, 24, 32, 48, 64, 96, 128}) {
+                if (R > b->nseq * VERIFY_MAX || R > BATCH_MAX) break;
+                b->shared_ms.push_back({R, b->cost_ms[VERIFY_MAX] + slope * (R - VERIFY_MAX)});
+            }
         }
     }
     if (b->draft) {
@@ -1351,7 +1547,16 @@ extern "C" void bolt_prof_report(Bolt* b) {
     std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.second.first > y.second.first; });
     double total = 0;
     for (auto& e : v) total += e.second.first;
-    fprintf(stderr, "bolt prof: total %.2f ms over the profiled blocks\n", total);
+    fprintf(stderr, "bolt prof: total %.2f ms over %d blocks of %.1f rows\n", total, b->prof_rows_n, b->prof_rows_n ? (double)b->prof_rows / b->prof_rows_n : 0.0);
+    b->prof_rows = 0; b->prof_rows_n = 0;
+    if (b->moe_stat) {
+        int st[2] = {0, 0};
+        CK(cudaMemcpy(st, b->moe_stat, 8, cudaMemcpyDeviceToHost));
+        CK(cudaMemset(b->moe_stat, 0, 8));
+        auto it = b->prof_acc.find("moe.up");
+        const int launches = it == b->prof_acc.end() ? 0 : it->second.second;
+        if (launches > 0) fprintf(stderr, "  moe: %.1f distinct experts and %.1f work items a layer\n", (double)st[0] / launches, (double)st[1] / launches);
+    }
     for (auto& e : v) fprintf(stderr, "  %-18s %9.2f ms %5.1f%%  %6d calls  %.1f us each\n", e.first.c_str(), e.second.first, 100 * e.second.first / total, e.second.second, 1000 * e.second.first / e.second.second);
     b->prof_acc.clear();
 }
@@ -1374,6 +1579,8 @@ extern "C" void* bolt_snap_save_seq(Bolt* b, int seq, int at) {
     Bolt::Seq& q = b->seqs[seq];
     if (at != q.len || at <= 0) return nullptr;
     flush_ingest(b, seq);
+    fold_pending(b, seq);
+    const size_t slots = b->ssm_lazy ? 1 : 2;
     Snap* sn = new Snap();
     sn->at = at;
     sn->draft_clen = draft_clen(b->draft, seq);
@@ -1387,7 +1594,7 @@ extern "C" void* bolt_snap_save_seq(Bolt* b, int seq, int at) {
     const size_t kv0 = (size_t)seq * b->kv_stride;   // tokens
     for (Layer& ly : b->layers) {
         if (ly.type == 0) {
-            CK(cudaMemcpyAsync(sn->ssm + (size_t)mi * SSM_ELEMS, ly.ssm + ((size_t)seq * 2 + q.ssm) * SSM_ELEMS, (size_t)SSM_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
+            CK(cudaMemcpyAsync(sn->ssm + (size_t)mi * SSM_ELEMS, ly.ssm + ((size_t)seq * slots + q.ssm) * SSM_ELEMS, (size_t)SSM_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
             CK(cudaMemcpyAsync(sn->conv + (size_t)mi * CONV_ELEMS, ly.conv + ((size_t)seq * CONV_SLOTS + q.conv) * CONV_ELEMS, (size_t)CONV_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
             mi++;
         } else if (ly.type == 2) {
@@ -1415,11 +1622,13 @@ extern "C" int bolt_snap_restore_seq(Bolt* b, int seq, void* handle) {
     const size_t kvb = (size_t)sn->at * b->kv_row, scb = b->kv_fp8 ? (size_t)sn->at * 2 * 4 : 0, lay = 2 * (kvb + scb);
     int mi = 0, ai = 0;
     const size_t kv0 = (size_t)seq * b->kv_stride;
+    const size_t slots = b->ssm_lazy ? 1 : 2;
     q.ssm = 0;
     q.conv = 0;
+    q.pending = 0;
     for (Layer& ly : b->layers) {
         if (ly.type == 0) {
-            CK(cudaMemcpyAsync(ly.ssm + (size_t)seq * 2 * SSM_ELEMS, sn->ssm + (size_t)mi * SSM_ELEMS, (size_t)SSM_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
+            CK(cudaMemcpyAsync(ly.ssm + (size_t)seq * slots * SSM_ELEMS, sn->ssm + (size_t)mi * SSM_ELEMS, (size_t)SSM_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
             CK(cudaMemcpyAsync(ly.conv + (size_t)seq * CONV_SLOTS * CONV_ELEMS, sn->conv + (size_t)mi * CONV_ELEMS, (size_t)CONV_ELEMS * 4, cudaMemcpyDeviceToDevice, b->s0));
             mi++;
         } else if (ly.type == 2) {

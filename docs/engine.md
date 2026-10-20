@@ -1,6 +1,6 @@
 # The Bolt backend and engine
 
-`./start.sh` builds TensorFold at `46a08c18`, applies `patches/`, copies `engine/bolt_native.zig` and `engine/bolt_api.zig` into
+`./start.sh` builds TensorFold at `76aafcf2` (v1.1.0), applies `patches/`, copies `engine/bolt_native.zig` and `engine/bolt_api.zig` into
 `zig/src/families/nemotron/` and compiles `engine/*.cu` into `/opt/tensorfold/lib/libbolt.so`. `tensorfold-native`
 opens the checkpoint through the `nemotron_h_puzzle` family that `patches/0002` registers, loads libbolt from its own `lib/` and serves.
 
@@ -45,7 +45,8 @@ sets it), which sizes the recurrent state. Extra jobs beyond N queue.
 
 ## libbolt (`engine/`)
 
-- `bolt_host.cu`: loading, the block forward, the C API (`bolt_abi` is its version, 2, which the backend checks at load;
+- `bolt_host.cu`: loading, the block forward, the C API (`bolt_abi` is its version, 3, which the backend checks at load;
+  `bolt_keep_multi` cuts every stream of a round back in one call;
   `bolt_prefill_seq_rows` takes image rows by device pointer; `bolt_mask_rows` redraws rows under a grammar's masks), sequences, snapshots, calibration. A *block* is a list of
   segments, each a run of rows of one sequence (a prompt chunk is one segment; a shared decode round has one verify
   window per stream). `Ctl` carries what changes between replays: tokens, and per segment its first row, cache length,
@@ -55,7 +56,10 @@ sets it), which sizes the recurrent state. Extra jobs beyond N queue.
 - `bolt_mma.cu`: tensor-core GEMMs for NVFP4, Q8_0, bf16 and IQ2_XXS from 16-row tiles (layouts in the file header);
   `mma_big_k` stages activations in shared memory for prompt blocks over 32 rows, while decode and verify blocks
   (`mma_decode_rows`) use the K-split kernel at any row count, 64 tokens a CTA. Prompt attention and verify-window
-  attention on bf16 mma with online softmax (`attn_mma_part_k`; for windows one CTA is one stream's window).
+  attention on bf16 mma with online softmax (`attn_mma2_part_k` for prompt chunks with the bf16 cache: `cp.async`
+  staging and `ldmatrix` fragments, `BOLT_ATTN_V2=0` for the first kernel; `attn_mma_part_k` for windows, one CTA a
+  stream's window, and the fp8 cache). The prompt pass's NVFP4 projections run on the block-scaled fp4 MMA
+  (`mma_nv4_fp4_k`, `BOLT_NV4_FP4`).
 - `bolt_kernels.cu`: norms, the Mamba conv and scan (a row-parallel conv and a thread-pair scan for long blocks, a
   warp-per-channel scan for windows), the router, the routed experts on int8 tensor cores, candidate selection.
 - `bolt_draft.cu`: the LiLiCorr drafter: five DFlash layers (grouped conv, sliding-window sink attention, NVFP4 MLP)
@@ -92,6 +96,16 @@ masked top-k with a CPU reference for a mask of 5 tokens, about half the vocabul
 - **SSM**: two copies of the 4 MiB-a-layer fp32 state. A block reads one and writes the other, so a verify window only
   writes its final state; `keep(n)` for a partial accept replays the first `n` rows from the pre-window copy
   (`k_scan_replay`, using the window's saved scan inputs). Rolling back to zero rows is a pointer flip.
+  With `BOLT_SSM_LAZY=1` (`SSM_LAZY`) there is one copy: a verify window writes no state, the conv saves each row's scan
+  inputs in one of two per-sequence slots of eight rows, `keep(n)` records `n` (`Seq.pending`), and the sequence's next
+  block folds those rows in at the start of its scan (`Ctl.seg_replay`, `seg_hist`), writes the state once and runs its
+  own rows from it; a prompt chunk commits its final state as before, and a snapshot with rows pending folds them first
+  (`k_scan_fold`). The default: measured on a Spark, replies are the same token for token and 4 to 16 streams decode 3 to 8 %
+  more tokens a second (one stream the same). `BOLT_SSM_LAZY=0` keeps two copies.
+- **Prompt chunks' NVFP4 projections** (`NV4_FP4`, default 1): `in_proj` and `out_proj` run on the block-scaled fp4
+  MMA (`kind::mxf4nvf4`, m16n8k64, e4m3 scales a block of 16) with the rows quantized to NVFP4 first (`quant_nv4_rows_k`);
+  the weights are read as stored, reordered into the MMA's fragment order at load (`tile_nv4w_k`, a second copy). Verify
+  blocks keep the fp16 rows. Perplexity +0.8 % on `engine/tools/ppl.cu` for +17 to 20 % prefill; libbolt builds for `sm_121a`.
 - **Conv**: a ring of nine slots; a window writes the state after each row, `keep(n)` picks slot `n`.
 - **Attention K/V**: bf16, 8 KB a token; with `BOLT_KV=fp8` (`KV_DTYPE=fp8`) e4m3 bytes plus an fp32 scale per token and
   head (amax / 448, set when the row is stored), 4.1 KB a token. The kernels dequantize while staging tiles, so the
@@ -103,7 +117,8 @@ masked top-k with a CPU reference for a mask of 5 tokens, about half the vocabul
   a growing stream leaves alone; past it the forward fails instead of freezing the machine.
 - **Drafter**: a 2048-entry K/V ring per layer and the anchor row; prompt rows older than 1,100 never reach it.
 
-Memory a sequence holds from load: 0.4 GiB (two SSM copies over 40 layers, the conv ring) plus the drafter's 21 MB.
+Memory a sequence holds from load: 0.41 GiB (two SSM copies over 40 layers, the conv ring) plus the drafter's 21 MB;
+0.28 GiB with one copy (`SSM_LAZY=1`, which adds 27 MB of saved scan inputs).
 
 ### Why a round costs what it does
 
@@ -115,6 +130,14 @@ which is why TensorFold's cost rule asks for longer windows when streams are few
 rows over 16 sequences, before the fixed summation order below: 16 → 61, 32 → 96, 64 → 141, 128 → 197. With it, 16
 streams of 4-row windows (64 rows) take 141.7 ms and 16 streams of 8-row windows (128 rows) 220.3 ms; 8 streams of
 8-row windows (64 rows) 130.4 ms against 135.5 before.
+
+The round loop prices a shared round as a table by total rows plus an overhead it learns per stream count, so the
+table libbolt reports (`bolt_shared_costs`) holds what rows cost, not streams: one stream's window costs for 2, 4 and
+8 rows, then a line at the cost of a row, measured at load as all sequences with 1 row each against 8 each (the same
+states, more rows). `BOLT_CAL=spread` reports the older table instead, measured with the rows spread over as many
+sequences as possible, which carries every sequence's state traffic into the price of a row. The drafter's proposal is
+a flat cost a round (seven drafts in one pass whatever the depth), reported as `mtp_step_ms` 0 and measured by the loop
+as overhead.
 
 ## Checks
 

@@ -2,8 +2,8 @@
 
 - [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart ([ashhart](https://github.com/ashhart)) and the
   [TensorFold contributors](https://github.com/ashhart/TensorFold/graphs/contributors). This recipe pins
-  `46a08c18608153bfc566703a88acc883bc6140f4` (1.0.12): its Zig server, RADIO image tower, video decoder (`libtfvideo`)
-  and [Nemotron recipes](https://github.com/ashhart/TensorFold/blob/46a08c18608153bfc566703a88acc883bc6140f4/docs/recipes/nemotron-3.5-super-vl.md).
+  `76aafcf274e60a5e31a59ce145b2f71f7b366e9d` (v1.1.0): its Zig server, RADIO image tower, video decoder (`libtfvideo`)
+  and [Nemotron recipes](https://github.com/ashhart/TensorFold/blob/76aafcf274e60a5e31a59ce145b2f71f7b366e9d/docs/recipes/nemotron-3.5-super-vl.md).
 - [NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB) by
   NVIDIA, revision `a326822af111290f2af5ac59ef4b5040347dabc4`. The weights are under the OpenMDW License Agreement,
   version 1.1, and are downloaded at setup. They are not part of this repository.
@@ -18,7 +18,7 @@
   [libjpeg-turbo](https://libjpeg-turbo.org) 3.1.4.1, which the image builds for TensorFold's JPEG decoder.
 - Christian Schröder ([cwschroeder](https://github.com/cwschroeder)) reviewed the video change for TensorFold
   ([#940](https://github.com/ashhart/TensorFold/pull/940)): the patch that keeps user text spelling the video token
-  ordinary (and its tests) is theirs, carried in `patches/0003`, and their reproducer found the rows-buffer sizing bug fixed there.
+  ordinary (and its tests) is theirs, carried in `patches/0003` until TensorFold 1.1.0 took it in (#940), and their reproducer found the rows-buffer sizing bug fixed there.
 - [xgrammar](https://github.com/mlc-ai/xgrammar) v0.2.8 (Apache-2.0), with [picojson](https://github.com/kazuho/picojson)
   (BSD-2-Clause) and [dlpack](https://github.com/dmlc/dlpack) (Apache-2.0): TensorFold's `libtfgrammar`, which the image
   builds so structured output and forced tool calls work. xgrammar's NOTICE ships in the image.

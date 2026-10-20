@@ -4,6 +4,7 @@
 
 #include "bolt_draft.h"
 
+#include <cuda_fp16.h>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -158,9 +159,54 @@ TNV4 tensor_nv4(File& f, const std::string& name) {
     return w;
 }
 
+// A bf16 matrix of the checkpoint as the kernels read it: Q8_0 tiles (BOLT_DRAFT_Q8=1, the default), else bf16 tiles.
+struct Lin { TBF bf{}; TQ8 q8{}; };
+
+bool draft_q8() {
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("BOLT_DRAFT_Q8"); on = e ? atoi(e) != 0 : 1; }
+    return on != 0;
+}
+
+// bf16 -> Q8_0 on the host (ggml's blocks: a half scale and 32 int8 a block of 32 along k), then the target's tile layout.
+// The drafter's attention and kernel projections read half the bytes a proposal; the outputs they draft are checked by
+// the target, so the rounding changes what is proposed, never what is served.
+Lin tensor_lin(File& f, const std::string& name) {
+    Lin w;
+    const uint8_t* d; Info i;
+    if (!get(f, name, d, i)) return w;
+    if (!draft_q8() || i.shape.size() != 2 || i.shape[1] % 32 != 0) { w.bf = tensor_bf16(f, name); return w; }
+    const int n = (int)i.shape[0], k = (int)i.shape[1], KB = k / 32;
+    std::vector<uint8_t> raw((size_t)n * KB * 34);
+    const uint16_t* src = (const uint16_t*)d;
+    for (int row = 0; row < n; row++) for (int kb = 0; kb < KB; kb++) {
+        float v[32], amax = 0.f;
+        for (int j = 0; j < 32; j++) { v[j] = bf2f(src[(size_t)row * k + kb * 32 + j]); amax = fmaxf(amax, fabsf(v[j])); }
+        const float dsc = amax / 127.f, inv = dsc > 0.f ? 1.f / dsc : 0.f;
+        uint8_t* blk = &raw[((size_t)row * KB + kb) * 34];
+        const __half hd = __float2half(dsc);
+        memcpy(blk, &hd, 2);
+        for (int j = 0; j < 32; j++) {
+            int q = (int)lrintf(v[j] * inv);
+            q = q < -128 ? -128 : q > 127 ? 127 : q;
+            blk[2 + j] = (uint8_t)(int8_t)q;
+        }
+    }
+    w.q8.n = n; w.q8.k = k;
+    void* r = up_raw(raw.data(), raw.size());
+    void *qt, *dt;
+    CK(cudaMalloc(&qt, tile_bytes_q8(n, k)));
+    CK(cudaMalloc(&dt, tile_scale_bytes_q8(n, k)));
+    tile_q8(0, (const uint8_t*)r, qt, dt, n, k);
+    CK(cudaDeviceSynchronize());
+    cudaFree(r);
+    w.q8.q = (const uint4*)qt; w.q8.d = (const uint32_t*)dt;
+    return w;
+}
+
 struct DLayer {
     float *in_norm = nullptr, *post_norm = nullptr, *qn = nullptr, *kn = nullptr, *sink = nullptr, *base_a = nullptr, *base_m = nullptr;
-    TBF q{}, k{}, v{}, o{}, att_kp{}, mlp_kp{};
+    Lin q{}, k{}, v{}, o{}, att_kp{}, mlp_kp{};
     TNV4 gate{}, up{}, down{};
 };
 
@@ -614,7 +660,8 @@ __global__ void l2norm_k(float* x, float eps) {
 }
 
 // Greedy walk through the lattice: slot 0 from the anchor, then each slot from the previous choice.
-__global__ void walk_k(const float* anchor_out_all, const float* outv_all, const float* inv_all, const int* ids_all, int* result_all) {
+// BOLT_DRAFT_TOP1=1 takes rank 0 at every slot (plain DFlash) instead of the lattice's choice, to measure what the lattice adds
+__global__ void walk_k(const float* anchor_out_all, const float* outv_all, const float* inv_all, const int* ids_all, int* result_all, int top1) {
     const int b = blockIdx.x;
     const float* anchor_out = anchor_out_all + (size_t)b * LH;
     const float* outv = outv_all + (size_t)b * NODES * LH;
@@ -636,7 +683,7 @@ __global__ void walk_k(const float* anchor_out_all, const float* outv_all, const
         __syncthreads();
         if (threadIdx.x == 0) {
             int best = 0;
-            for (int k = 1; k < TOPK; k++) if (sc[k] > sc[best]) best = k;
+            if (!top1) for (int k = 1; k < TOPK; k++) if (sc[k] > sc[best]) best = k;
             prev = best;
             result[s + 1] = ids[(s + 1) * CAND + best];
         }
@@ -714,6 +761,14 @@ void mm(const TNV4& w, const float* x, int ldx, float* y, int ldy, int T, const 
     }
     if (bias) bias_k<<<((size_t)T * w.n + 255) / 256, 256, 0, S>>>(y, bias, w.n, T);
 }
+void mm(const Lin& w, const float* x, int ldx, float* y, int ldy, int T, const float* bias = nullptr) {
+    if (!w.q8.q) { mm(w.bf, x, ldx, y, ldy, T, bias); return; }
+    for (int base = 0; base < T; base += TMAX) {
+        int nt = T - base < TMAX ? T - base : TMAX;
+        mma_q8(S, w.q8, x + (size_t)base * ldx, ldx, y + (size_t)base * ldy, ldy, nt);
+    }
+    if (bias) bias_k<<<((size_t)T * w.q8.n + 255) / 256, 256, 0, S>>>(y, bias, w.q8.n, T);
+}
 void rms(const float* x, const float* w, float* y, int n, int rows, float eps = EPS) { rms_rows_k<<<rows, 256, 0, S>>>(x, w, y, n, eps); }
 void addv(float* y, const float* a, size_t n) { add_k<<<(unsigned)((n + 255) / 256), 256, 0, S>>>(y, a, n); }
 void silu_inplace(float* y, size_t n) { silu_k<<<(unsigned)((n + 255) / 256), 256, 0, S>>>(y, n); }
@@ -735,10 +790,10 @@ Draft* draft_open(const char* dir, const uint16_t* embed, const TQ8& head, int n
         DLayer& a = d->L[l];
         a.in_norm = tensor_f32(f, p + ".input_layernorm.weight", H);
         a.post_norm = tensor_f32(f, p + ".post_attention_layernorm.weight", H);
-        a.q = tensor_bf16(f, p + ".self_attn.q_proj.weight");
-        a.k = tensor_bf16(f, p + ".self_attn.k_proj.weight");
-        a.v = tensor_bf16(f, p + ".self_attn.v_proj.weight");
-        a.o = tensor_bf16(f, p + ".self_attn.o_proj.weight");
+        a.q = tensor_lin(f, p + ".self_attn.q_proj.weight");
+        a.k = tensor_lin(f, p + ".self_attn.k_proj.weight");
+        a.v = tensor_lin(f, p + ".self_attn.v_proj.weight");
+        a.o = tensor_lin(f, p + ".self_attn.o_proj.weight");
         a.qn = tensor_f32(f, p + ".self_attn.q_norm.weight", HD);
         a.kn = tensor_f32(f, p + ".self_attn.k_norm.weight", HD);
         a.sink = tensor_f32(f, p + ".self_attn.attention_sink_bias", HEADS);
@@ -747,8 +802,8 @@ Draft* draft_open(const char* dir, const uint16_t* embed, const TQ8& head, int n
         a.down = tensor_nv4(f, p + ".mlp.down_proj");
         a.base_a = tensor_f32(f, p + ".attention_conv.base_kernel", 4 * H);
         a.base_m = tensor_f32(f, p + ".mlp_conv.base_kernel", 4 * H);
-        a.att_kp = tensor_bf16(f, p + ".attention_conv.kernel_projection.weight");
-        a.mlp_kp = tensor_bf16(f, p + ".mlp_conv.kernel_projection.weight");
+        a.att_kp = tensor_lin(f, p + ".attention_conv.kernel_projection.weight");
+        a.mlp_kp = tensor_lin(f, p + ".mlp_conv.kernel_projection.weight");
     }
     d->sq.resize(nseq < 1 ? 1 : nseq);
     for (auto& q : d->sq) {
@@ -863,7 +918,7 @@ Draft* draft_open(const char* dir, const uint16_t* embed, const TQ8& head, int n
         CK(cudaMallocHost(&d->irow_seq_h, TMAX * 4)); CK(cudaMallocHost(&d->irow_pos_h, TMAX * 4));
     }
     CK(cudaDeviceSynchronize());
-    fprintf(stderr, "bolt: LiLiCorr resident, fc %d x %d\n", d->fc.n, d->fc.k);
+    fprintf(stderr, "bolt: LiLiCorr resident, fc %d x %d, attention and kernel projections %s\n", d->fc.n, d->fc.k, draft_q8() ? "Q8_0" : "bf16");
     return d;
 }
 
@@ -1066,7 +1121,8 @@ void draft_propose_multi(Draft* d, int n, const int* seqs, const int* anchors, c
     mm(d->anc_h, d->astate, LH, d->aout, LH, B, d->anc_b);
     l2norm_k<<<B, 256, 0, s>>>(d->aout, VEPS);
     dmark("heads");
-    walk_k<<<B, 256, 0, s>>>(d->aout, d->edges_out, d->edges_in, d->cids, d->out_dev);
+    static const int top1 = getenv("BOLT_DRAFT_TOP1") && atoi(getenv("BOLT_DRAFT_TOP1")) != 0;
+    walk_k<<<B, 256, 0, s>>>(d->aout, d->edges_out, d->edges_in, d->cids, d->out_dev, top1);
     dmark("walk");
     CK(cudaMemcpyAsync(d->out_host, d->out_dev, (size_t)B * SLOTS * 4, cudaMemcpyDeviceToHost, s));
     CK(cudaStreamSynchronize(s));

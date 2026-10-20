@@ -33,7 +33,8 @@ the Spark stays free for other work. The server takes text, images and video (se
 `./start.sh` prepares the image, `scripts/config.sh` holds the settings, `patches/` is applied onto a pinned
 TensorFold commit.
 
-TensorFold's Nemotron family serves Lightning 30B-A3B; this checkpoint is `nemotron_h_puzzle` (hidden 4096, 88
+TensorFold's Nemotron family serves Lightning 30B-A3B and, since 1.1.0, Bolt itself (its own GGML kernels, without
+the LiLiCorr drafter); this checkpoint is `nemotron_h_puzzle` (hidden 4096, 88
 blocks, per-layer expert counts, IQ2_XXS experts). `patches/0002-register-bolt.patch` registers a Bolt backend,
 `engine/bolt_native.zig` (with its libbolt binding, `engine/bolt_api.zig`), in the native CUDA host, as the family `nemotron_h_puzzle`. The backend is a TensorFold *lane backend*: the HTTP server, chat
 template, thinking budget, round loop, stop handling and keyed sampler are TensorFold's own. The forward pass lives in
@@ -42,37 +43,50 @@ template, thinking budget, round loop, stop handling and keyed sampler are Tenso
 
 ## Speed
 
-Measured with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) against the running server (`Nemotron-3.5-Bolt`).
-"×N" is N clients at once; TTFT is the time to the first token. The decode tables are from the current build; the prefill table is from an earlier run (the prompt path has not changed since).
+Decode measured on 2026-10-20 with TensorFold's [`tools/bench_concurrent.py`](https://github.com/ashhart/TensorFold/blob/76aafcf274e60a5e31a59ce145b2f71f7b366e9d/tools/bench_concurrent.py)
+against the running server (this build's defaults, thinking off): N clients send the same
+prompt at once, 256 tokens each, medians of three runs. "aggregate" is the server's tokens a second over all N, "each
+stream" one client's decode rate, TTFT the slowest client's time to its first token. The prefill table is from an
+earlier run with [sparkDash](https://github.com/MiaAI-Lab/sparkDash) (the prompt path has not changed since). The
+1.0.12 build measured the same way on the same day is in [`CHANGELOG.md`](CHANGELOG.md), cell for cell.
 
-Decode, prose prompts:
+Decode, greedy (`temperature 0`):
 
-| clients | aggregate | each stream | TTFT |
-| ---: | ---: | ---: | ---: |
-| ×1 | 71.0 tok/s | 71.0 tok/s | 56 ms |
-| ×2 | 91.5 tok/s | 47.3 tok/s | 297 ms |
-| ×4 | 126.8 tok/s | 35.2 tok/s | 575 ms |
-| ×8 | 166.6 tok/s | 23.5 tok/s | 1.23 s |
+| clients | prose aggregate | prose each | code aggregate | code each | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| ×1 | 73.7 tok/s | 73.7 tok/s | 137.3 tok/s | 137.3 tok/s | 50–70 ms |
+| ×8 | 240.3 tok/s | 32.7 tok/s | 342.0 tok/s | 48.5 tok/s | 0.9–1.0 s |
+| ×16 | 284.4 tok/s | 20.4 tok/s | 385.1 tok/s | 29.2 tok/s | 2.3–2.6 s |
 
-Decode, code prompts:
+Decode, sampled (`temperature 1.0`, `top_p 0.95`, seeded):
 
-| clients | aggregate | each stream | TTFT |
-| ---: | ---: | ---: | ---: |
-| ×1 | 114.1 tok/s | 114.1 tok/s | 55 ms |
-| ×2 | 160.9 tok/s | 83.3 tok/s | 198 ms |
-| ×4 | 198.3 tok/s | 54.0 tok/s | 403 ms |
-| ×8 | 245.3 tok/s | 35.8 tok/s | 985 ms |
+| clients | prose aggregate | prose each | code aggregate | code each | TTFT |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| ×1 | 70.6 tok/s | 70.6 tok/s | 133.4 tok/s | 133.4 tok/s | 50–70 ms |
+| ×8 | 205.4 tok/s | 28.1 tok/s | 230.7 tok/s | 39.0 tok/s | 0.9–1.0 s |
+| ×16 | 251.1 tok/s | 18.4 tok/s | 280.0 tok/s | 23.9 tok/s | 2.3–2.6 s |
 
-Prefill, cold prompts of one request:
+Every cell's replies were token for token the same as the 1.0.12 build's, with `SSM_LAZY=0` and with `DRAFT_Q8=0`
+(the tool's `token_sha256` over all three runs).
+
+Prefill (2026-10-20) with a fresh random-word prompt and `max_tokens 1` (so the prompt cache cannot help), in
+tokens a second of prompt: 2,310 to 2,410 at 2.7k tokens, 2,490 to 2,510 at 5.3k, 2,485 at 21k, 2,365 at 42k,
+2,255 at 63k, 1,975 at 126k (the 1.0.12 build: 1,640, 1,690, 1,650, 1,520, and 987 at 128k). These are with
+`NV4_FP4=1`, the prompt pass's two NVFP4 projections on the fp4 tensor cores with NVFP4 rows, which costs 0.8 %
+perplexity on the harness in `engine/tools`; `NV4_FP4=0` keeps fp16 rows and the exact numbers at about 7 % less.
+The long-context end comes from a prompt attention kernel that is 2.2 to 2.5× the old one with identical outputs.
+See [`docs/speed-research.md`](docs/speed-research.md) for where the time goes and what is left to do.
+
+Prefill, cold prompts of one request (this build, `max_tokens 1`):
 
 | prompt | prefill | TTFT | tokens |
 | ---: | ---: | ---: | ---: |
-| 4k | 1,575.6 tok/s | 2.80 s | 4,135 |
-| 8k | 1,536.8 tok/s | 5.53 s | 8,231 |
-| 16k | 1,480.8 tok/s | 11.27 s | 16,424 |
-| 32k | 1,375.1 tok/s | 24.03 s | 32,809 |
-| 64k | 1,212.3 tok/s | 54.27 s | 65,579 |
-| 128k | 986.8 tok/s | 133.04 s | 131,115 |
+| 2.7k | 2,312 to 2,408 tok/s | 1.1 s | 2,656 to 2,663 |
+| 5.3k | 2,493 to 2,508 tok/s | 2.1 s | 5,270 to 5,346 |
+| 21k | 2,483 tok/s | 8.5 s | 21,014 to 21,046 |
+| 42k | 2,365 tok/s | 17.8 s | 41,905 to 42,400 |
+| 63k | 2,254 tok/s | 28.1 s | 63,214 |
+| 126k | 1,973 tok/s | 64.1 s | 126,455 |
 
 ## How it is built
 
@@ -89,7 +103,10 @@ In the order it matters:
    the latent projection run on side streams. A prompt goes through in 1,024-row chunks, a shared decode round in a handful of padded shapes.
 3. **Rollback is cheap.** A verify window writes only its final Mamba state, to the spare of two copies, and the scan
    inputs of its rows; `keep(n)` flips a pointer, or replays `n` rows from the untouched copy for a partial accept. KV
-   rows past the kept prefix are overwritten later.
+   rows past the kept prefix are overwritten later. With `SSM_LAZY=1` there is one copy: the window writes no state at
+   all, `keep(n)` only notes `n`, and the stream's next forward folds those `n` saved rows in before its own, so a
+   partial accept costs no replay pass and a stream holds 0.28 GiB instead of 0.41 (the default; 3 to 8 % more tokens a
+   second at 4 to 16 streams, the same replies; see the changelog).
 4. **TensorFold drives the speculation.** The backend implements `verify` (one forward over every stream's pending
    token and held drafts, every row drawn with the stream's keyed sampler), `keep` and `draft`. LiLiCorr proposes
    seven tokens a stream and round, for all streams in one pass. TensorFold's cost rule chooses how many to verify
@@ -106,8 +123,8 @@ In the order it matters:
    one-token step runs as a one-row window for the same reason, so drafted and plain decoding agree. The price is paid
    in the widest rounds: 16 streams of 8-row windows (128 rows) take about 25 % longer; 64-row rounds are unchanged.
 8. **Memory follows use.** Every stream has the full 262,144-token window, but its attention rows are mapped from the
-   GPU's virtual memory 4,096 tokens at a time and returned when it ends; only the 0.4 GiB of recurrent state per
-   stream is held from load.
+   GPU's virtual memory 4,096 tokens at a time and returned when it ends; only the 0.41 GiB of recurrent state per
+   stream (0.28 with `SSM_LAZY=1`) is held from load.
 
 The three bugs that made the old engine's drafter accept 0 of 7 are fixed: the shared expert read the *updated*
 residual's norm instead of the block input's, Mamba's `dt` was clamped at 0.001 (the config's limit is 0), and the
@@ -191,7 +208,7 @@ cd Nemotron-3.5-Bolt-TensorFold-DGX-Spark
 ./start.sh
 ```
 
-The first run builds TensorFold at `46a08c18` (1.0.12) with `patches/` and the engine in `engine/`, downloads the checkpoint
+The first run builds TensorFold at `76aafcf2` (v1.1.0) with `patches/` and the engine in `engine/`, downloads the checkpoint
 (23 GiB) and the LiLiCorr drafter (1.3 GB), checks them, starts the server and sends a smoke request. Later runs
 reuse the image and the snapshots. Loading takes about 45 seconds with the files in the page cache.
 
@@ -225,7 +242,7 @@ defaults (`./start.sh restart --context 131072`). `DRY_RUN=1` prints the docker 
 **`scripts/prepare.sh`:**
 
 1. Preflight: Docker, disk, `MemAvailable`.
-2. The image `tensorfold-nemotron-bolt:zig-46a08c1`: TensorFold at `TF_REF` with every `patches/*.patch` applied,
+2. The image `tensorfold-nemotron-bolt:zig-76aafcf`: TensorFold at `TF_REF` with every `patches/*.patch` applied,
    `zig test zig/src/families/nemotron/config.zig`, Zig 0.17.0, on `nvcr.io/nvidia/pytorch:26.07-py3`, then
    `zig build -Dnvcc=… install native`. It tries a prebuilt image from GitHub Container Registry first
    (`PULL=0` builds locally). No image is published for this revision, so the first run builds.
@@ -248,8 +265,8 @@ reserves every stream's whole window up front (see below), and `PARALLEL` or `CO
 
 Weights on disk at the pinned revision: 22.45 GiB. `CKPT_GIB` is 23.
 
-Each of the `PARALLEL` streams holds 0.4 GiB from load: two copies of the 168 MiB fp32 SSM state (a verify window
-reads one and writes the other), the conv ring and the drafter's 21 MB context. Its attention rows are mapped as it
+Each of the `PARALLEL` streams holds 0.41 GiB from load: two copies of the 160 MiB fp32 SSM state (a verify window
+reads one and writes the other; `SSM_LAZY=1` keeps one and the stream holds 0.28 GiB), the conv ring and the drafter's 21 MB context. Its attention rows are mapped as it
 grows (8 KB a token) and given back when it ends, so sixteen streams at the full window would take 32 GiB only if all of
 them filled it; `BOLT_KV_RESERVE_GIB` (default 3) is the free memory a growing stream leaves alone, and a forward that
 would pass it fails instead of freezing the machine. The prompt cache (`PROMPT_CACHE_GIB`) comes on top.
@@ -260,7 +277,7 @@ would pass it fails instead of freezing the machine. The prompt cache (`PROMPT_C
 
 `prepare.sh` and `start.sh` refuse to run when `MemAvailable` is under 10 GiB (`MEM_FLOOR_GIB`). Keep at least
 10 GiB free under load. On this machine, exhausting unified memory freezes it. A smaller `PARALLEL` or `CONTEXT` is the
-way to trade; `PARALLEL=1` holds 0.4 GiB of state.
+way to trade; `PARALLEL=1` holds 0.41 GiB of state.
 
 ## Configuration
 
@@ -280,6 +297,10 @@ Every setting lives in [`scripts/config.sh`](scripts/config.sh). Override it fro
 | `MAX_TOKENS` | `32768` | the reply budget when a request sets none |
 | `KV_PIN` | `0` | `1` maps every stream's whole `CONTEXT` window at load and keeps it: `PARALLEL` × `CONTEXT` × 8 KB (bf16) or 4.1 KB (fp8), e.g. 8 × 262,144 = 16 GiB. The memory is then certain, and a start that cannot have it fails at once, naming `PARALLEL`, `CONTEXT` and `KV_DTYPE` |
 | `KV_DTYPE` | `bf16` | `fp8` stores K and V as e4m3 with an fp32 scale per token and head: 4.1 KB a token instead of 8 KB, so twice the tokens in the same memory and half the prompt-cache bytes. Passed to libbolt as `BOLT_KV` (the native server itself refuses `--kv-dtype`). No speed cost; see below |
+| `SSM_LAZY` | `1` | one copy of each stream's Mamba state instead of two: a verify window writes none, and the stream's next forward folds the kept rows in from the saved scan inputs, so a partial accept costs no replay pass and a stream holds 0.28 GiB from load instead of 0.41. Measured: the same replies token for token, 3 to 8 % more tokens a second at 4 to 16 streams, no change alone. `0` is the two-copy path (`BOLT_SSM_LAZY`) |
+| `BOLT_*` | | any `BOLT_*` variable in the environment is passed into the container: libbolt's own switches, e.g. `BOLT_PACK=0` (fp32 GEMM rows), `BOLT_MOE_COOP=0`, `BOLT_ATTN_V2=0` (the first prompt attention kernel), `BOLT_PDL=0`, `BOLT_CAL=spread`, `BOLT_PROF=1`, `BOLT_STATS=1`; and the off-by-default experiments `BOLT_IQ2_WHOLE=1`, `BOLT_SHARED_DECODE=1`, `BOLT_DENSE_RING=1`, `BOLT_TILE=1` (see the changelog) |
+| `NV4_FP4` | `1` | the prompt pass's `in_proj` and `out_proj` on the fp4 tensor cores with the rows quantized to NVFP4 (vLLM's NVFP4 path does the same): prefill +17 to 20 %, perplexity +0.8 % on the harness. `0` keeps fp16 rows (`BOLT_NV4_FP4`) |
+| `DRAFT_Q8` | `1` | the LiLiCorr drafter's attention and kernel projections as Q8_0 instead of bf16, half the bytes a proposal reads. Every draft is checked by the target, so this changes what is proposed, never the reply; `0` keeps bf16 (`BOLT_DRAFT_Q8`). Measured: the same replies and the same speed within noise either way (a proposal takes 6.4 ms against 7.2); Q8_0 keeps 200 MB |
 | `VISION` | `1` | loads TensorFold's RADIO tower and projector (1.7 GB) so requests can carry images and video: `--vision` and the four limits below. `0` serves text only and skips the weights |
 | `VISION_MAX_IMAGES` / `VISION_MAX_VIDEOS` | `64` / `4` | pictures and clips one request may hold |
 | `VISION_IMAGE_TOKENS` / `VISION_VIDEO_TOKENS` | `262144` / `131072` | the visual tokens a request's images (and its videos) share; each gets an equal part of its total |
@@ -358,10 +379,10 @@ BMP pictures.
 
 - `patches/0001-vision-image-tokens.patch`: `--vision-image-tokens` up to 262,144 (it stopped at 16,384).
 - `patches/0002-register-bolt.patch`: the family `nemotron_h_puzzle` (an omni config around a puzzle text model reads as
-  that type), its registration in the CUDA host, prompt-cache rules without lookahead, `zig build bolt` for libbolt, and
-  structured output's server side (`server/vocab.zig`: an omni checkpoint's `vocab_size` sits in `llm_config`).
-- `patches/0003-nemotron-video.patch`: video through the RADIO tower (tubelets, the processor's frame labels), the
-  template's `<video>` turned into one token before encoding, `--vision-max-videos`.
+  that type in the server and the `models` CLI), its registration in the CUDA host beside upstream's own Bolt family,
+  `--parallel` handed to a family that sizes its state by it, `zig build bolt` for libbolt, and `zig build
+  compile-bolt-family`, which compiles the backend without a GPU. Video input (TensorFold #940) and the omni vocabulary
+  size for structured output (#951), patches of this recipe before, are upstream's in 1.1.0.
 - `engine/bolt_native.zig` and `engine/bolt_api.zig` (its libbolt binding; both copied into the family at build time) are
   the lane backend; `engine/*.cu` builds
   `libbolt.so` (`zig build bolt -Dbolt-src=engine`, linked with `-lcuda` for the virtual-memory calls). [`docs/engine.md`](docs/engine.md) has the
@@ -385,10 +406,10 @@ python3 scripts/ckptcheck.py /path/to/snapshot
 start.sh      prepare, check, launch
 stop.sh       stop a launch
 scripts/      prepare.sh, config.sh, publish-image.sh, banner.sh, ckptcheck.py (+ its test)
-patches/      the Bolt gate and registration, and image/video input, applied onto TensorFold at TF_REF
+patches/      the Bolt registration and the image-token cap, applied onto TensorFold at TF_REF
 engine/       bolt_native.zig and bolt_api.zig (lane backend and its libbolt binding), the CUDA sources of libbolt.so
 contract/     bolt.json, the pinned checkpoint's schedule and quant groups
-docs/         engine.md, the backend and the engine
+docs/         engine.md, the backend and the engine; speed-research.md, the stage profiles and the plan
 .github/      issue and pull request templates, GitHub Sponsors
 CREDITS.md    who and what this builds on
 CHANGELOG.md  upgrade notes

@@ -24,10 +24,10 @@ QUANT_LABEL="IQ2_XXS+NVFP4+Q8_0"
 DRAFT_ID="${DRAFT_ID:-nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr}"
 DRAFT_REVISION="${DRAFT_REVISION:-4c6a5613b6d887194a3a5493e3a18a5b3930bb86}"
 
-# TensorFold main at 1.0.12 (Nemotron 3.5 Super VL on CUDA, its RADIO tower). patches/ add the Bolt family, video input and
-# a larger image-token cap. Zig ZIG_VERSION builds the native CUDA server.
+# TensorFold v1.1.0 (its RADIO tower, image and video input, structured output for omni checkpoints). patches/ register
+# the libbolt Bolt family and lift the image-token cap. Zig ZIG_VERSION builds the native CUDA server.
 TF_REPO="${TF_REPO:-https://github.com/ashhart/TensorFold.git}"
-TF_REF="${TF_REF:-46a08c18608153bfc566703a88acc883bc6140f4}"
+TF_REF="${TF_REF:-76aafcf274e60a5e31a59ce145b2f71f7b366e9d}"
 ZIG_VERSION="${ZIG_VERSION:-0.17.0}"
 ZIG_SHA256="${ZIG_SHA256:-9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8}"
 BASE_IMAGE="${BASE_IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}"
@@ -35,7 +35,7 @@ TF_TAG="zig-${TF_REF:0:7}"
 IMAGE="${IMAGE:-tensorfold-nemotron-bolt:${TF_TAG}}"
 image_hash() {
   ( cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
-    cat patches/*.patch engine/* 2>/dev/null
+    cat patches/*.patch engine/*.cu engine/*.h engine/*.inc engine/*.zig 2>/dev/null
     sed -n "/<<'DOCKERFILE'/,/^DOCKERFILE\$/p" scripts/prepare.sh
     echo "$TF_REPO $TF_REF zig-$ZIG_VERSION $ZIG_SHA256 $BASE_IMAGE nemotron-bolt"
   ) | sha256sum | cut -c1-12
@@ -70,6 +70,20 @@ KV_DTYPE="${KV_DTYPE:-bf16}"
 # 1 maps every stream's whole CONTEXT window at load and keeps it (PARALLEL x CONTEXT x 8 KB in bf16, 4.1 KB in fp8), so the
 # memory is certain and a start that cannot have it fails at once. 0 maps it as streams grow and gives it back.
 KV_PIN="${KV_PIN:-0}"
+# 1 keeps one copy of each stream's Mamba state instead of two: a verify window writes no state, and the rows it keeps are
+# folded in by the stream's next forward from the scan inputs it saved, so a partial accept costs no replay pass and a
+# stream holds 0.28 GiB from load instead of 0.41. Measured on a Spark: the same replies token for token, 3 to 8% more
+# tokens a second at 4 to 16 streams, no change alone (BOLT_SSM_LAZY). 0 is the two-copy path.
+SSM_LAZY="${SSM_LAZY:-1}"
+# 1 stores the LiLiCorr drafter's attention and kernel projections as Q8_0 (half the bytes a proposal reads); the target
+# checks every draft, so this changes what is proposed, never the reply. 0 keeps them bf16 (BOLT_DRAFT_Q8). Measured: the
+# same replies and the same speed within noise either way; Q8_0 keeps 200 MB of memory.
+# BOLT_CAL=spread (passed through when set) calibrates the planner's shared-round table the 1.0.12 way, by spread rows.
+DRAFT_Q8="${DRAFT_Q8:-1}"
+# 1 runs the prompt pass's NVFP4 projections (in_proj, out_proj) on the fp4 tensor cores with the rows quantized to NVFP4 as
+# vLLM's NVFP4 path does: prefill +17 to 20 %, perplexity +0.8 % on the harness (prose +1.2 %, code +0.4 %); the first
+# token of a prompt was unchanged in every test, later greedy tokens can differ. 0 keeps the fp16 rows (BOLT_NV4_FP4).
+NV4_FP4="${NV4_FP4:-1}"
 MAX_TOKENS="${MAX_TOKENS:-32768}"
 THINKING="${THINKING:-1}"
 # generation_config.json: temperature 1.0, top_p 0.95. TOP_K empty omits --top-k.
@@ -93,8 +107,8 @@ SERVE="${SERVE:-1}"
 
 # Weights on the Hub at MODEL_REVISION: usedStorage 24,102,448,875 bytes (22.45 GiB). CKPT_GIB rounds that up.
 # One token's bf16 attention cache is 8 layers * 2 kv heads * 128 * 2 bytes * 2 (K and V) = 8192 bytes.
-# Mamba state is per sequence: 168 MiB of SSM state in fp32, two copies (a verify window reads one and writes the other),
-# plus the conv ring, 0.4 GiB a stream, allocated for all PARALLEL streams at load.
+# Mamba state is per sequence: 160 MiB of SSM state in fp32, two copies (a verify window reads one and writes the other),
+# plus the conv ring, 0.41 GiB a stream (0.28 with SSM_LAZY=1), allocated for all PARALLEL streams at load.
 MEM_NEED_GIB="${MEM_NEED_GIB:-}"
 MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-$TENSORFOLD_MEMORY_RESERVE_GIB}"
 kv_gib() {
@@ -107,11 +121,12 @@ kv_gib() {
 # mapped as streams grow, down to BOLT_KV_RESERVE_GIB left free), TensorFold's reserve and the prompt cache.
 # Vision adds the tower and projector (1.7 GB) and a scratch that grows with the largest picture (about 1 GiB at 3,000 px).
 mem_need_gib() {
-  local ctx=${1:-$CONTEXT} vis=0
+  local ctx=${1:-$CONTEXT} vis=0 per=45
   [[ "$VISION" == 1 ]] && vis=3
+  [[ "$SSM_LAZY" == 1 ]] && per=30   # hundredths of a GiB a stream holds from load
   (( ctx > 65536 )) && ctx=65536
-  if [[ "$KV_PIN" == 1 ]]; then ctx=${1:-$CONTEXT}; echo $(( vis + CKPT_GIB + (PARALLEL * 45 + 99) / 100 + PARALLEL * $(kv_gib "$ctx") + MEM_FLOOR_GIB + 2 + PROMPT_CACHE_GIB )); return; fi
-  echo $(( vis + CKPT_GIB + (PARALLEL * 45 + 99) / 100 + $(kv_gib "$ctx") + MEM_FLOOR_GIB + 2 + PROMPT_CACHE_GIB ))
+  if [[ "$KV_PIN" == 1 ]]; then ctx=${1:-$CONTEXT}; echo $(( vis + CKPT_GIB + (PARALLEL * per + 99) / 100 + PARALLEL * $(kv_gib "$ctx") + MEM_FLOOR_GIB + 2 + PROMPT_CACHE_GIB )); return; fi
+  echo $(( vis + CKPT_GIB + (PARALLEL * per + 99) / 100 + $(kv_gib "$ctx") + MEM_FLOOR_GIB + 2 + PROMPT_CACHE_GIB ))
 }
 
 HF_CACHE="${HF_CACHE:-${HF_HOME:-$HOME/.cache/huggingface}}"

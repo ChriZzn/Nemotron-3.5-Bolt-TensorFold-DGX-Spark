@@ -106,7 +106,7 @@ if [[ $REBUILD -eq 1 || "$built_hash" != "$PATCHES_HASH" ]]; then
   trap 'rm -rf -- "$ctx"' EXIT
   mkdir -p "$ctx/patches" "$ctx/engine"
   compgen -G 'patches/*.patch' >/dev/null && cp -- patches/*.patch "$ctx/patches/"
-  cp -- engine/* "$ctx/engine/"
+  cp -- engine/*.cu engine/*.h engine/*.inc engine/*.zig "$ctx/engine/"   # the sources only (engine/tools holds the microbenchmarks)
   nocache=(); [[ $REBUILD -eq 1 ]] && nocache=(--no-cache)
   docker build "${nocache[@]}" -t "$IMAGE" --build-arg BASE_IMAGE="$BASE_IMAGE" \
     --build-arg TF_REPO="$TF_REPO" --build-arg TF_REF="$TF_REF" \

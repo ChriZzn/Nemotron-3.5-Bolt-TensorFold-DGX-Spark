@@ -25,3 +25,4 @@ engine/*.so
 
 # developer benches, kernel tests and lab scripts: kept locally, not published
 tools/
+.idea

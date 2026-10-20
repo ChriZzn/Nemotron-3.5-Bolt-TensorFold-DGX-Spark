@@ -2,7 +2,7 @@
 const std = @import("std");
 
 /// The C ABI version of libbolt this backend speaks (`bolt_abi`).
-pub const abi_version: c_int = 2;
+pub const abi_version: c_int = 3;
 
 extern "c" fn dlopen(path: [*:0]const u8, mode: c_int) ?*anyopaque;
 extern "c" fn dlsym(handle: ?*anyopaque, name: [*:0]const u8) ?*anyopaque;
@@ -26,6 +26,7 @@ pub const Api = struct {
     forward_multi: *const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]const c_int, c_int) callconv(.c) c_int,
     candidates: *const fn (?*anyopaque, c_int, c_int, [*]f32, [*]c_int) callconv(.c) void,
     keep: *const fn (?*anyopaque, c_int, c_int) callconv(.c) void,
+    keep_multi: *const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int) callconv(.c) void,
     propose: *const fn (?*anyopaque, c_int, c_int, [*]c_int) callconv(.c) c_int,
     propose_multi: *const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]c_int, [*]c_int) callconv(.c) void,
     has_draft: *const fn (?*anyopaque) callconv(.c) c_int,
@@ -54,6 +55,7 @@ pub const Api = struct {
             .forward_multi = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]const c_int, c_int) callconv(.c) c_int, handle, "bolt_forward_multi"),
             .candidates = try sym(*const fn (?*anyopaque, c_int, c_int, [*]f32, [*]c_int) callconv(.c) void, handle, "bolt_candidates"),
             .keep = try sym(*const fn (?*anyopaque, c_int, c_int) callconv(.c) void, handle, "bolt_keep_seq"),
+            .keep_multi = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int) callconv(.c) void, handle, "bolt_keep_multi"),
             .propose = try sym(*const fn (?*anyopaque, c_int, c_int, [*]c_int) callconv(.c) c_int, handle, "bolt_propose_seq"),
             .propose_multi = try sym(*const fn (?*anyopaque, c_int, [*]const c_int, [*]const c_int, [*]c_int, [*]c_int) callconv(.c) void, handle, "bolt_propose_multi"),
             .has_draft = try sym(*const fn (?*anyopaque) callconv(.c) c_int, handle, "bolt_has_draft"),

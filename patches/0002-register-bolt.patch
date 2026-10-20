@@ -23,7 +23,7 @@ index 00000000..f56d6246
 +        return;
 +    };
 +    const root: std.Build.LazyPath = .{ .cwd_relative = dir };
-+    const run = b.addSystemCommand(&.{ tool, "-shared", "-Xcompiler", "-fPIC", "-O3", "-gencode", "arch=compute_121,code=sm_121", "-I" });
++    const run = b.addSystemCommand(&.{ tool, "-shared", "-Xcompiler", "-fPIC", "-O3", "-gencode", "arch=compute_121a,code=sm_121a", "-I" });
 +    run.addDirectoryArg(root);
 +    run.addArg("-o");
 +    const lib = run.addOutputFileArg("libbolt.so");
@@ -32,18 +32,18 @@ index 00000000..f56d6246
 +    step.dependOn(&b.addInstallFile(lib, "native/lib/libbolt.so").step);
 +}
 diff --git a/zig/build/cuda.zig b/zig/build/cuda.zig
-index 684d6c3c..26e993ec 100644
+index 5fadb17f..1e1b1f31 100644
 --- a/zig/build/cuda.zig
 +++ b/zig/build/cuda.zig
-@@ -3,6 +3,7 @@
+@@ -2,6 +2,7 @@
  const std = @import("std");
  const exlr8_build = @import("exlr8.zig");
  const golden_build = @import("golden.zig");
 +const bolt_build = @import("bolt.zig");
- 
- /// Each .cu in zig/kernels/cuda (`src`, else `name`) with the flags its Python extension passes in `extra_cuda_cflags`.
- const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]const u8 = null, arch_specific: bool = false };
-@@ -111,6 +112,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
+ const catalog = @import("cuda_kernels.zig");
+ const Kernel = catalog.Kernel;
+ const torch_flags = catalog.torch_flags;
+@@ -52,6 +53,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
      const prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files to embed");
      const sms = b.option([]const u8, "sm", "SASS targets, comma separated (default 121; 80, 86, 89, 120 and 121 build)") orelse "121";
      const strip = b.option(bool, "strip", "No debug info in the CUDA executables: no build machine paths leave with them") orelse false;
@@ -51,8 +51,23 @@ index 684d6c3c..26e993ec 100644
      // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
      const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
          const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
+@@ -319,6 +321,14 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
+     }) });
+     bolt.dependOn(&compile_bolt.step);
+     step.dependOn(&compile_bolt.step);
++    // the libbolt lane backend (zig/src/families/nemotron/bolt_native.zig, copied in from a recipe) without a GPU or the library
++    const compile_lib = b.addObject(.{ .name = "bolt_lib_compile", .root_module = b.createModule(.{
++        .root_source_file = b.path("zig/tests/bolt_lib_compile.zig"),
++        .target = cuda_target,
++        .link_libc = true,
++        .imports = &.{ .{ .name = "cuda", .module = check_cuda }, .{ .name = "nemotron", .module = check_mods.nemotron } },
++    }) });
++    b.step("compile-bolt-family", "Compile the libbolt lane backend (nemotron_h_puzzle) without a GPU").dependOn(&compile_lib.step);
+     for ([_]*std.Build.Module{ mods.nemotron, mods.lanes, mods.radio }) |m|
+         bolt.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+     const video_step = b.step("test-omni-video-host", "Actual RADIO and Bolt video boundaries without a GPU or decoder library");
 diff --git a/zig/src/cli/hub.zig b/zig/src/cli/hub.zig
-index 99d6835a..cccb1f11 100644
+index 4a90bace..9af3344b 100644
 --- a/zig/src/cli/hub.zig
 +++ b/zig/src/cli/hub.zig
 @@ -11,6 +11,7 @@ pub const Family = struct { model_type: []const u8, title: []const u8, formats:
@@ -63,14 +78,14 @@ index 99d6835a..cccb1f11 100644
      .{ .model_type = "qwen4_exp", .title = "Qwen3.8 Flash Next" },
      .{ .model_type = "glm5_next", .title = "GLM-5.3-Flash" },
      .{ .model_type = "qwen3_5", .title = "Qwen3.5-2B or Qwen3.8-27B" },
-@@ -114,14 +115,18 @@ pub fn configInt(a: Allocator, io: std.Io, dir: []const u8, key: []const u8) ?u6
+@@ -117,14 +118,18 @@ pub fn configInt(a: Allocator, io: std.Io, dir: []const u8, key: []const u8) ?u6
      return if (v == .integer and v.integer >= 0) @intCast(v.integer) else null;
  }
  
 -/// config.json's model_type, "unknown" when unreadable.
 +/// config.json's model_type, "unknown" when unreadable; an omni wrapper of a puzzle model (Bolt) is nemotron_h_puzzle.
  pub fn modelType(a: Allocator, io: std.Io, dir: []const u8) []const u8 {
-     const text = readSmall(a, io, pathJoin(a, dir, "config.json") catch return "unknown") orelse return "unknown";
+     const text = @import("checkpoint_config").optional(a, io, dir) orelse return "unknown";
      var parsed = std.json.parseFromSlice(std.json.Value, a, text, .{}) catch return "unknown";
      defer parsed.deinit();
      if (parsed.value != .object) return "unknown";
@@ -84,69 +99,62 @@ index 99d6835a..cccb1f11 100644
  }
  
  /// config.json's quantization: bits and group size, when the checkpoint is MLX-affine quantized.
-@@ -196,6 +201,11 @@ test "cache layout helpers read a synthetic cache" {
+@@ -196,6 +201,12 @@ test "cache layout helpers read a synthetic cache" {
      const snapshot = (try cachedSnapshot(a, io, hub, "Org/Name")).?;
      try std.testing.expect(std.mem.endsWith(u8, snapshot, "0123456789abcdef0123456789abcdef01234567"));
      try std.testing.expectEqualStrings("qwen4_exp", modelType(a, io, snapshot));
-+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ snapshot, "config.json" }), .data = "{\"model_type\": \"nemotron_h_omni\", \"llm_config\": {\"model_type\": \"nemotron_h_puzzle\"}}" });
++    const cfg = try std.fs.path.join(a, &.{ snapshot, "config.json" });
++    try w.writeFile(io, .{ .sub_path = cfg, .data = "{\"model_type\": \"nemotron_h_omni\", \"llm_config\": {\"model_type\": \"nemotron_h_puzzle\"}}" });
 +    try std.testing.expectEqualStrings("nemotron_h_puzzle", modelType(a, io, snapshot));
-+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ snapshot, "config.json" }), .data = "{\"model_type\": \"nemotron_h_omni\", \"llm_config\": {\"model_type\": \"nemotron_h\"}}" });
++    try w.writeFile(io, .{ .sub_path = cfg, .data = "{\"model_type\": \"nemotron_h_omni\", \"llm_config\": {\"model_type\": \"nemotron_h\"}}" });
 +    try std.testing.expectEqualStrings("nemotron_h_omni", modelType(a, io, snapshot));
-+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ snapshot, "config.json" }), .data = "{\"model_type\": \"qwen4_exp\", \"quantization\": {\"bits\": 6, \"group_size\": 32}, \"max_position_embeddings\": 65536}" });
++    try w.writeFile(io, .{ .sub_path = cfg, .data = "{\"model_type\": \"qwen4_exp\", \"quantization\": {\"bits\": 6, \"group_size\": 32}, \"max_position_embeddings\": 65536}" });
      const q = quantization(a, io, snapshot).?;
      try std.testing.expectEqual(@as(u64, 6), q.bits);
      try std.testing.expectEqual(@as(u64, 32), q.group);
 diff --git a/zig/src/families/nemotron/cuda.zig b/zig/src/families/nemotron/cuda.zig
-index 12ff32c8..5abe6998 100644
+index c221b283..1fe058b9 100644
 --- a/zig/src/families/nemotron/cuda.zig
 +++ b/zig/src/families/nemotron/cuda.zig
-@@ -28,6 +28,7 @@ pub const reuse = @import("cuda_reuse.zig");
+@@ -33,6 +33,8 @@ pub const pages = @import("cuda_pages.zig");
  pub const slide = @import("cuda_slide.zig");
  pub const worker = @import("cuda_worker.zig");
  pub const omni = @import("cuda_native_omni.zig");
++/// Nemotron 3.5 Bolt over libbolt (nemotron_h_puzzle): the lane backend a recipe copies in beside this file.
 +pub const bolt = @import("bolt_native.zig");
- pub const identity = @import("cuda_identity.zig");
+ pub const identity = @import("core").checkpoint_identity;
  
  test {
 diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
-index 254a8799..b697b9ee 100644
+index 84f106a0..b3d1b122 100644
 --- a/zig/src/native/cuda.zig
 +++ b/zig/src/native/cuda.zig
-@@ -15,7 +15,7 @@ const cuda_disk = @import("cuda_disk.zig");
- const vision_offer = @import("cuda_vision_offer.zig");
- 
+@@ -24,7 +24,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
+ const drafted = @import("cuda_drafted.zig");
+ const kv_pages = @import("cuda_kv_pool.zig");
  /// CUDA families provide metadata, open their lane backend and explain their refusals.
--const registry = .{ nemotron.native, nemotron.omni, glm.native };
-+const registry = .{ nemotron.native, nemotron.omni, nemotron.bolt, glm.native };
- 
+-const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native };
++const registry = .{ nemotron.native, nemotron.omni, nemotron.bolt, glm.native, qwen35.native, qwen35.native_moe, flashnext.native };
  /// --record opens here (engines.zig refuses it for a backend without this).
  pub const records = true;
-@@ -335,6 +335,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
-         opts.precision = std.meta.stringToEnum(@typeInfo(@TypeOf(opts.precision)).optional.child, @tagName(p)).?;
-     }
-     if (@hasField(F.Options, "room")) opts.room = .{ .ctx = &probe, .read = Probe.read };
-+    if (@hasField(F.Options, "lanes")) opts.lanes = o.lanes;
-     if (weights > before.room(held0)) {
-         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
-         return null;
-diff --git a/zig/src/native/cuda_snaps.zig b/zig/src/native/cuda_snaps.zig
-index bbaedc2c..5a294c64 100644
---- a/zig/src/native/cuda_snaps.zig
-+++ b/zig/src/native/cuda_snaps.zig
-@@ -4,7 +4,7 @@ const api = @import("engine_api");
+ pub const backends: []const []const u8 = &.{"cuda"};
+diff --git a/zig/src/native/cuda_options.zig b/zig/src/native/cuda_options.zig
+index 9f18f404..2de9cb23 100644
+--- a/zig/src/native/cuda_options.zig
++++ b/zig/src/native/cuda_options.zig
+@@ -34,6 +34,7 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
+     if (comptime @hasField(F.Options, "drafter")) opts.drafter = o.drafter;
+     if (comptime @hasField(F.Options, "drafter_bits")) opts.drafter_bits = o.drafter_bits;
+     if (@hasField(F.Options, "kv8")) opts.kv8 = o.kv8;
++    if (@hasField(F.Options, "lanes")) opts.lanes = o.lanes; // a family that keeps one sequence of state per stream
+     return true;
+ }
  
- /// Any row, the head one token on (Nemotron's); `snap_grid`'s chunk starts and `warm_quiet`'s warm turns if declared.
- pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
--    var rules: api.prompt_cache.Rules = .{ .lookahead = 1, .min_prompt = 0 };
-+    var rules: api.prompt_cache.Rules = .{ .lookahead = if (@hasDecl(F, "snap_lookahead")) F.snap_lookahead else 1, .min_prompt = 0 };
-     if (@hasDecl(F, "warm_quiet")) rules.warm = .waits;
-     if (@hasDecl(F, "snap_grid")) {
-         rules.planned = true;
 diff --git a/zig/src/server/main.zig b/zig/src/server/main.zig
-index 48039508..248c4548 100644
+index f1cceb9e..5a791949 100644
 --- a/zig/src/server/main.zig
 +++ b/zig/src/server/main.zig
-@@ -160,7 +160,12 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8) []const u8 {
+@@ -168,7 +168,12 @@ fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]cons
      const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return "unknown";
      if (doc != .object) return "unknown";
      const t = doc.object.get("model_type") orelse return "unknown";
@@ -160,83 +168,20 @@ index 48039508..248c4548 100644
  }
  
  /// generation_config.json's sampling (``do_sample`` false is greedy), then the serve flags over it.
-diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
-index 381c864a..ecba18bf 100644
---- a/zig/src/server/root.zig
-+++ b/zig/src/server/root.zig
-@@ -46,6 +46,7 @@ test {
-     _ = @import("image_key.zig");
-     _ = @import("media_fetch.zig");
-     _ = @import("videos.zig");
-+    _ = @import("vocab.zig");
-     _ = @import("stream_preflight_test.zig");
-     _ = @import("stream_dsml_test.zig");
-     _ = @import("logprobs_test.zig");
-diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
-index 54065817..b0d11b4e 100644
---- a/zig/src/server/server.zig
-+++ b/zig/src/server/server.zig
-@@ -23,6 +23,7 @@ const live = @import("live.zig");
- const slide_graph = @import("slide_graph.zig");
- const slide_lesson = @import("slide_lesson.zig");
- const cortheon = @import("cortheon/cortheon.zig");
-+const vocab_size = @import("vocab.zig");
- const Value = json.Value;
- const Cx = errors.Cx;
- const Allocator = std.mem.Allocator;
-@@ -229,7 +230,7 @@ pub const Server = struct {
-         return .{ .kind = kind, .text = text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .compiler = c };
-     }
- 
--    /// The model's grammar compiler: tokenizer.json, config.json's vocab_size (text_config first), the eos ids.
-+    /// The model's grammar compiler: tokenizer.json, config.json's vocab_size (the text model's), the eos ids.
-     fn grammarCompiler(srv: *Server) ?*api.grammar.Compiler {
-         srv.grammar_mutex.lockUncancelable(srv.io);
-         defer srv.grammar_mutex.unlock(srv.io);
-@@ -244,10 +245,7 @@ pub const Server = struct {
-                 .ok => |v| v,
-                 .err => break :blk "config.json is not JSON",
-             };
--            var vocab: ?u32 = null;
--            for ([_]?json.Value{ cfg.get("text_config"), cfg }) |part| if (vocab == null) if (part) |p| if (p.get("vocab_size")) |v| if (v.int64()) |n| {
--                vocab = @intCast(n);
--            };
-+            const vocab = vocab_size.size(cfg);
-             if (vocab == null) break :blk "structured output needs the checkpoint's config.json vocab_size";
-             var err: [512]u8 = undefined;
-             const c = a.create(api.grammar.Compiler) catch break :blk "out of memory";
-diff --git a/zig/src/server/vocab.zig b/zig/src/server/vocab.zig
+diff --git a/zig/tests/bolt_lib_compile.zig b/zig/tests/bolt_lib_compile.zig
 new file mode 100644
-index 00000000..d5db492d
+index 00000000..a677fe85
 --- /dev/null
-+++ b/zig/src/server/vocab.zig
-@@ -0,0 +1,29 @@
-+//! The vocabulary size a checkpoint declares, for the token masks of structured output.
++++ b/zig/tests/bolt_lib_compile.zig
+@@ -0,0 +1,11 @@
++//! Generate the libbolt lane backend's open and vtable bodies (zig/src/families/nemotron/bolt_native.zig) without a GPU.
 +const std = @import("std");
-+const json = @import("json");
-+
-+/// config.json's vocab_size: the text model's (text_config, or an omni checkpoint's llm_config) before the top level's.
-+pub fn size(cfg: json.Value) ?u32 {
-+    for ([_]?json.Value{ cfg.get("text_config"), cfg.get("llm_config"), cfg }) |part| if (part) |p| if (p.get("vocab_size")) |v| if (v.int64()) |n| {
-+        if (n > 0 and n <= std.math.maxInt(u32)) return @intCast(n);
-+    };
-+    return null;
-+}
-+
-+fn parse(a: std.mem.Allocator, text: []const u8) !json.Value {
-+    return switch (try json.parse(a, text)) {
-+        .ok => |v| v,
-+        .err => error.TestUnexpectedResult,
-+    };
-+}
-+
-+test "the vocabulary is the text model's: text_config, llm_config of an omni wrapper, else the top level" {
-+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-+    defer arena.deinit();
-+    const a = arena.allocator();
-+    try std.testing.expectEqual(@as(?u32, 131072), size(try parse(a, "{\"model_type\": \"nemotron_h_omni\", \"llm_config\": {\"vocab_size\": 131072}}")));
-+    try std.testing.expectEqual(@as(?u32, 151936), size(try parse(a, "{\"text_config\": {\"vocab_size\": 151936}, \"vocab_size\": 1}")));
-+    try std.testing.expectEqual(@as(?u32, 32000), size(try parse(a, "{\"vocab_size\": 32000}")));
-+    try std.testing.expectEqual(@as(?u32, null), size(try parse(a, "{\"llm_config\": {\"hidden_size\": 4096}}")));
-+    try std.testing.expectEqual(@as(?u32, null), size(try parse(a, "{\"vocab_size\": 0}")));
++const cuda = @import("cuda");
++const n = @import("nemotron");
++export fn boltLibCompile(ctx: *const cuda.Context, io: *const std.Io, path: [*:0]const u8, images: bool, lanes: u32) void {
++    const loaded = n.bolt.open(std.heap.page_allocator, io.*, ctx, std.mem.span(path), null, .{ .context = 256, .drafts = true, .lanes = lanes, .vision = if (images) .{ .image_tokens = 3328, .max_images = 1 } else null }) catch return;
++    defer loaded.deinit(loaded.ctx);
++    loaded.backend.vtable.verify(loaded.backend.ptr, &.{}, &.{}) catch {};
++    _ = n.bolt.snap_bytes(loaded.target, 1);
++    _ = n.bolt.explain(null, error.BoltLoad);
 +}
